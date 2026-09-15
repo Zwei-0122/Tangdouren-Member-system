@@ -5,8 +5,10 @@ import { createAdminClient } from '@/lib/supabase/admin'
 import { createClient } from '@/lib/supabase/server'
 import { calcBillingMinutes, calcBill } from '@/lib/timer/pricing'
 import { resolveActiveSeatCodeFromValue } from '@/lib/timer/selfService'
+import { computeSettlement } from '@/lib/coupon/coupon'
+import { loadSettlementContext, mapRpcError } from '@/lib/coupon/service'
 
-type Action = 'start' | 'pause' | 'resume' | 'stop' | 'settle' | 'update_table'
+type Action = 'start' | 'pause' | 'resume' | 'stop' | 'settle' | 'unsettle' | 'update_table'
 
 export async function GET(
   _req: NextRequest,
@@ -46,7 +48,11 @@ export async function DELETE(
     .eq('session_id', id)
 
   if (error) {
-    console.error('[DELETE /api/admin/timers]', error)
+    console.error('[DELETE /api/admin/timers]', error.message)
+    // 已核销优惠券的订单受外键约束保护（coupons.redeemed_session_id → ON DELETE RESTRICT）
+    if (error.code === '23503') {
+      return NextResponse.json({ error: '该订单已核销优惠券，请先撤销结算再删除' }, { status: 409 })
+    }
     return NextResponse.json({ error: '删除失败' }, { status: 500 })
   }
 
@@ -62,10 +68,11 @@ export async function PATCH(
   if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
 
   const { id }   = await params
-  const body     = await request.json() as { action: Action; actual_amount_gbp?: number; actual_amount_cny?: number; settlement_note?: string; table_number?: string }
+  // 注意：结算金额一律由服务端计算，客户端传入的 actual_amount_gbp / 折扣字段会被忽略
+  const body     = await request.json() as { action: Action; coupon_code?: string; settlement_note?: string; table_number?: string }
   const { action } = body
 
-  if (!['start', 'pause', 'resume', 'stop', 'settle', 'update_table'].includes(action)) {
+  if (!['start', 'pause', 'resume', 'stop', 'settle', 'unsettle', 'update_table'].includes(action)) {
     return NextResponse.json({ error: '无效操作' }, { status: 400 })
   }
 
@@ -98,35 +105,32 @@ export async function PATCH(
     }
     return NextResponse.json({ session: updated })
   }
-  if (session.status === 'completed' && action !== 'settle') {
+  if (session.status === 'completed' && action !== 'settle' && action !== 'unsettle') {
     return NextResponse.json({ error: '计时已结束' }, { status: 409 })
   }
 
   const now    = new Date()
   let update: Record<string, unknown> = {}
 
-  // ── 结算 ────────────────────────────────────────────────────────────────────
+  // ── 结算（服务端计算金额 + 同一事务内核销优惠券）─────────────────────────────
   if (action === 'settle') {
-    const actualGbp = body.actual_amount_gbp ?? session.amount_gbp
-    update = {
-      is_settled:        true,
-      actual_amount_gbp: actualGbp,
-      actual_amount_cny: body.actual_amount_cny ?? null,
-      settlement_note:   body.settlement_note   ?? null,
-      settled_at:        now.toISOString(),
-      settled_by:        user.email ?? user.id,
-    }
+    const ctx = await loadSettlementContext(admin, id, body.coupon_code)
+    if (!ctx.ok) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
 
-    const { data: updated, error: updateErr } = await admin
-      .from('timer_sessions')
-      .update(update)
-      .eq('session_id', id)
-      .select()
-      .single()
+    const computed = computeSettlement(ctx.context.session, ctx.context.coupon)
+    if (!computed.ok) return NextResponse.json({ error: computed.error }, { status: 400 })
 
-    if (updateErr) {
-      console.error('[settle /api/admin/timers]', updateErr)
-      return NextResponse.json({ error: '结算失败' }, { status: 500 })
+    const { data: settled, error: rpcErr } = await admin.rpc('settle_timer_session', {
+      p_session_id:            id,
+      p_settled_by:            user.email ?? user.id,
+      p_settlement_note:       body.settlement_note ?? null,
+      p_coupon_code:           computed.preview.couponCode,
+      p_discount_amount_pence: computed.preview.discountAmountPence,
+    })
+
+    if (rpcErr) {
+      console.error('[settle /api/admin/timers]', rpcErr.message)
+      return NextResponse.json({ error: mapRpcError(rpcErr.message) }, { status: 409 })
     }
 
     // 如果关联了预约，自动标记为已完成
@@ -139,7 +143,22 @@ export async function PATCH(
         .in('status', ['confirmed', 'payment_pending'])
     }
 
-    return NextResponse.json({ session: updated })
+    return NextResponse.json({ session: settled, preview: computed.preview })
+  }
+
+  // ── 撤销结算（同一事务内恢复优惠券）─────────────────────────────────────────
+  if (action === 'unsettle') {
+    const { data: unsettled, error: rpcErr } = await admin.rpc('unsettle_timer_session', {
+      p_session_id: id,
+    })
+
+    if (rpcErr) {
+      console.error('[unsettle /api/admin/timers]', rpcErr.message)
+      return NextResponse.json({ error: mapRpcError(rpcErr.message) }, { status: 409 })
+    }
+
+    // 关联预约的状态保持不动（撤销结算不回退预约）
+    return NextResponse.json({ session: unsettled })
   }
 
   if (action === 'start') {

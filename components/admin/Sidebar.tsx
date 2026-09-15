@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { LayoutDashboard, CalendarDays, Settings2, ImageIcon, Menu, X, LogOut, Timer } from 'lucide-react'
+import { LayoutDashboard, CalendarDays, Settings2, ImageIcon, Menu, X, LogOut, Timer, TicketPercent } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { createClient } from '@/lib/supabase/client'
 
@@ -11,6 +11,7 @@ const navItems = [
   { href: '/dashboard',          icon: LayoutDashboard, label: '概览' },
   { href: '/dashboard/bookings', icon: CalendarDays,    label: '预约管理' },
   { href: '/dashboard/timers',   icon: Timer,           label: '拼豆计时' },
+  { href: '/dashboard/coupons',  icon: TicketPercent,   label: '优惠券' },
   { href: '/dashboard/slots',    icon: Settings2,       label: 'Slot 配置' },
   { href: '/dashboard/gallery',  icon: ImageIcon,       label: '作品图库' },
 ]

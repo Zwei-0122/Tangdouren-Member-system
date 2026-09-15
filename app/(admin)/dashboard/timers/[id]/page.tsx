@@ -3,6 +3,7 @@
 import { useEffect, useState, useRef, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { formatHMS, formatChineseDuration, calcBillingMinutes, calcBill, TIMER_PRICING } from '@/lib/timer/pricing'
+import { describeDiscount, type DiscountType } from '@/lib/coupon/coupon'
 
 interface TimerSession {
   session_id:         string
@@ -29,6 +30,24 @@ interface TimerSession {
   settlement_note:    string | null
   settled_at:         string | null
   settled_by:         string | null
+  // 优惠券快照字段
+  coupon_id:                  string | null
+  coupon_code_snapshot:       string | null
+  discount_type_snapshot:     DiscountType | null
+  discount_value_snapshot:    number | null
+  discount_amount_gbp:        number | null
+  pre_discount_amount_gbp:    number | null
+}
+
+interface CouponPreview {
+  couponCode:          string | null
+  discountType:        DiscountType | null
+  discountValue:       number | null
+  description:         string
+  preDiscountGbp:      number
+  discountGbp:         number
+  finalGbp:            number
+  discountAmountPence: number
 }
 
 function calcElapsed(session: TimerSession): number {
@@ -347,14 +366,23 @@ export default function AdminTimerDetailPage() {
 }
 
 // ── 结算面板 ─────────────────────────────────────────────────────────────────
+// 金额一律由服务端计算：优惠码只做预验证预览，确认结算时服务端重新校验并原子核销。
 function SettlementPanel({ session, onSettled }: { session: TimerSession; onSettled: () => void }) {
-  const [actualGbp,  setActualGbp]  = useState(session.actual_amount_gbp?.toString() ?? session.amount_gbp?.toFixed(2) ?? '')
-  const [note,       setNote]       = useState(session.settlement_note ?? '')
-  const [saving,     setSaving]     = useState(false)
-  const [error,      setError]      = useState('')
+  const [code,      setCode]      = useState('')
+  const [preview,   setPreview]   = useState<CouponPreview | null>(null)
+  const [note,      setNote]      = useState(session.settlement_note ?? '')
+  const [verifying, setVerifying] = useState(false)
+  const [saving,    setSaving]    = useState(false)
+  const [error,     setError]     = useState('')
 
-  // 已结算 → 只展示结果
+  const inputCls = 'w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta'
+  const money    = (n: number | null | undefined) => n === null || n === undefined ? '—' : `£${n.toFixed(2)}`
+
+  // ── 已结算：展示完整收款记录 ───────────────────────────────────────────────
   if (session.is_settled) {
+    const couponContent = session.discount_type_snapshot && session.discount_value_snapshot !== null
+      ? describeDiscount(session.discount_type_snapshot, session.discount_value_snapshot)
+      : null
     return (
       <div className="bg-emerald-50 border border-emerald-200 rounded-2xl px-5 py-4">
         <div className="flex items-center gap-2 mb-3">
@@ -366,12 +394,28 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
         </div>
         <div className="space-y-1.5 text-sm">
           <div className="flex justify-between">
-            <span className="text-stone-500">应收</span>
-            <span className="font-medium text-stone-700">£{session.amount_gbp?.toFixed(2)}</span>
+            <span className="text-stone-500">系统原价</span>
+            <span className="font-medium text-stone-700">{money(session.pre_discount_amount_gbp ?? session.amount_gbp)}</span>
           </div>
-          <div className="flex justify-between">
+          {session.coupon_code_snapshot && (
+            <>
+              <div className="flex justify-between">
+                <span className="text-stone-500">优惠券</span>
+                <span className="font-mono text-xs font-semibold text-stone-700">{session.coupon_code_snapshot}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-stone-500">优惠内容</span>
+                <span className="font-medium text-stone-700">{couponContent ?? '—'}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-stone-500">优惠金额</span>
+                <span className="font-medium text-terracotta">−{money(session.discount_amount_gbp ?? 0)}</span>
+              </div>
+            </>
+          )}
+          <div className="flex justify-between pt-1.5 border-t border-emerald-200">
             <span className="text-stone-500">实收</span>
-            <span className="font-bold text-emerald-700 text-base">£{session.actual_amount_gbp?.toFixed(2)}</span>
+            <span className="font-bold text-emerald-700 text-base">{money(session.actual_amount_gbp)}</span>
           </div>
           {session.actual_amount_cny && (
             <div className="flex justify-between">
@@ -385,17 +429,48 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
             </div>
           )}
           {session.booking_id && (
-            <p className="text-xs text-stone-400 mt-1">关联预约已自动标记为已完成</p>
+            <p className="text-xs text-stone-400 mt-1">关联预约已标记为已完成</p>
           )}
           <p className="text-xs text-stone-400">结算人：{session.settled_by ?? '—'}</p>
         </div>
+
+        {error && <p className="text-sm text-red-500 mt-3">{error}</p>}
+
+        <button
+          onClick={handleUnsettle}
+          disabled={saving}
+          className="mt-4 w-full py-2.5 rounded-2xl border border-red-200 bg-white text-red-500 text-sm font-medium hover:bg-red-50 disabled:opacity-50 transition"
+        >
+          {saving ? '撤销中…' : '撤销结算'}
+        </button>
       </div>
     )
   }
 
+  async function handleVerify() {
+    const trimmed = code.trim().toUpperCase()
+    if (!trimmed) { setError('请输入优惠码'); return }
+    setError('')
+    setVerifying(true)
+    try {
+      const res  = await fetch('/api/admin/coupons/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: trimmed, sessionId: session.session_id }),
+      })
+      const data = await res.json() as { preview?: CouponPreview; error?: string }
+      if (!res.ok || !data.preview) { setPreview(null); setError(data.error ?? '验证失败'); return }
+      setPreview(data.preview)
+    } catch {
+      setPreview(null)
+      setError('网络错误，请重试')
+    } finally {
+      setVerifying(false)
+    }
+  }
+
   async function handleSettle() {
-    const gbpVal = parseFloat(actualGbp)
-    if (isNaN(gbpVal) || gbpVal < 0) { setError('请输入有效的实收金额'); return }
+    if (code.trim() && !preview) { setError('请先点击「验证」确认优惠码'); return }
     setError('')
     setSaving(true)
     try {
@@ -403,12 +478,12 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          action:            'settle',
-          actual_amount_gbp: gbpVal,
-          settlement_note:   note || null,
+          action:          'settle',
+          coupon_code:     code.trim() ? code.trim().toUpperCase() : undefined,
+          settlement_note: note || null,
         }),
       })
-      const data = await res.json()
+      const data = await res.json() as { error?: string }
       if (!res.ok) { setError(data.error ?? '结算失败'); return }
       onSettled()
     } catch {
@@ -418,7 +493,29 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
     }
   }
 
-  const inputCls = 'w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta'
+  async function handleUnsettle() {
+    if (!confirm('确认撤销这笔结算？订单已使用的优惠券会恢复为未使用。')) return
+    if (!confirm('再次确认：撤销后需要重新结算，继续？')) return
+    setError('')
+    setSaving(true)
+    try {
+      const res  = await fetch(`/api/admin/timers/${session.session_id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'unsettle' }),
+      })
+      const data = await res.json() as { error?: string }
+      if (!res.ok) { setError(data.error ?? '撤销失败'); return }
+      onSettled()
+    } catch {
+      setError('网络错误，请重试')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const originalGbp = session.amount_gbp ?? 0
+  const finalGbp    = preview ? preview.finalGbp : originalGbp
 
   return (
     <div className="bg-white border border-stone-100 rounded-2xl px-5 py-4 shadow-sm">
@@ -435,7 +532,7 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
           <span className="font-mono text-xs text-stone-600">{session.session_id}</span>
         </div>
         <div className="flex justify-between text-stone-500">
-          <span>计费时长</span>
+          <span>系统计费时长</span>
           <span className="font-medium text-stone-700">{session.billing_minutes} 分钟</span>
         </div>
         {session.started_at && (
@@ -451,26 +548,50 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
           </div>
         )}
         <div className="flex justify-between pt-1.5 border-t border-stone-200">
-          <span className="font-semibold text-stone-600">应收</span>
-          <span className="font-bold text-terracotta text-base">£{session.amount_gbp?.toFixed(2)}</span>
+          <span className="font-semibold text-stone-600">系统原价</span>
+          <span className="font-bold text-stone-800 text-base">{money(originalGbp)}</span>
         </div>
       </div>
 
-      {/* 实收输入 */}
-      <div className="mb-3">
-        <label className="block text-xs text-stone-400 mb-1">实收金额（£）</label>
-        <input
-          type="number" step="0.01" min="0"
-          className={inputCls}
-          value={actualGbp}
-          onChange={e => setActualGbp(e.target.value)}
-          placeholder={session.amount_gbp?.toFixed(2)}
-        />
+      {/* 优惠码 */}
+      <div className="mb-4">
+        <label className="block text-xs text-stone-400 mb-1">优惠码（可选）</label>
+        <div className="flex gap-2">
+          <input
+            className={inputCls + ' font-mono'}
+            placeholder="TDXXXXXXXX"
+            value={code}
+            onChange={e => { setCode(e.target.value.toUpperCase()); setPreview(null); setError('') }}
+            onKeyDown={e => e.key === 'Enter' && handleVerify()}
+          />
+          <button
+            onClick={handleVerify}
+            disabled={verifying || !code.trim()}
+            className="px-4 py-2 rounded-xl bg-stone-800 text-white text-sm font-medium hover:bg-stone-700 disabled:opacity-50 transition shrink-0"
+          >
+            {verifying ? '验证中…' : '验证'}
+          </button>
+        </div>
+        <p className="text-xs text-stone-400 mt-1">验证只做预览，不会核销；确认结算时才会真正使用。</p>
       </div>
+
+      {/* 优惠预览 */}
+      {preview && (
+        <div className="bg-terracotta/5 border border-terracotta/20 rounded-xl px-4 py-3 mb-4 text-sm space-y-1.5">
+          <div className="flex justify-between">
+            <span className="text-stone-500">优惠内容</span>
+            <span className="font-medium text-terracotta">{preview.description}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-stone-500">优惠金额</span>
+            <span className="font-medium text-terracotta">−{money(preview.discountGbp)}</span>
+          </div>
+        </div>
+      )}
 
       <div className="mb-4">
         <label className="block text-xs text-stone-400 mb-1">备注（可选）</label>
-        <textarea rows={2} className={inputCls + ' resize-none'} placeholder="如：微信支付、现金、已抹零…"
+        <textarea rows={2} className={inputCls + ' resize-none'} placeholder="如：微信支付、现金…"
           value={note} onChange={e => setNote(e.target.value)} />
       </div>
 
@@ -481,6 +602,11 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
       )}
 
       {error && <p className="text-sm text-red-500 mb-3">{error}</p>}
+
+      <div className="bg-stone-50 rounded-xl px-4 py-3 mb-4 flex items-center justify-between">
+        <span className="text-sm font-semibold text-stone-600">最终应收</span>
+        <span className="text-xl font-bold text-terracotta">{money(finalGbp)}</span>
+      </div>
 
       <button
         onClick={handleSettle}
