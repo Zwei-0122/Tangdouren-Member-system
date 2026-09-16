@@ -9,8 +9,11 @@ import { TIMER_PRICING } from '../timer/pricing.ts'
 export type DiscountType = 'fixed_amount' | 'percentage_off' | 'time_minutes'
 export type CouponStatus = 'unused' | 'redeemed' | 'expired'
 
-export const COUPON_CODE_PREFIX       = 'TD'
-export const COUPON_CODE_LENGTH       = 8      // 去掉易混淆字符后随机位数
+export const COUPON_CODE_PREFIX       = 'TD'   // 未指定活动前缀时的默认值（向后兼容）
+export const COUPON_CODE_LENGTH       = 5      // 去掉易混淆字符后随机位数
+export const MIN_CODE_PREFIX_LENGTH   = 2      // 活动前缀长度范围
+export const MAX_CODE_PREFIX_LENGTH   = 8
+export const RECOMMENDED_CODE_PREFIX_LENGTH = 5  // 超过则提示总长度偏长
 export const MIN_BILLING_MINUTES      = 60     // 首小时不可减免
 export const TIME_COUPON_STEP_MINUTES = 30     // 时长券必须是 30 分钟的整数倍
 export const MAX_GENERATE_QUANTITY    = 500    // 单次生成上限
@@ -40,6 +43,38 @@ export function fromPence(pence: number): number {
 /** 统一的优惠码输入规范化：去首尾空格 + 转大写 */
 export function normalizeCouponCode(raw: unknown): string {
   return typeof raw === 'string' ? raw.trim().toUpperCase() : ''
+}
+
+// ── 活动前缀 ────────────────────────────────────────────────────────────────
+
+/** 活动前缀规范化：去首尾空格 + 转大写；非字符串返回空串（调用方按默认前缀处理） */
+export function normalizeCodePrefix(raw: unknown): string {
+  return typeof raw === 'string' ? raw.trim().toUpperCase() : ''
+}
+
+const CODE_PREFIX_PATTERN = /^[A-Z0-9]+$/
+
+/** 前缀是否合法：2-8 位大写字母或数字 */
+export function isValidCodePrefix(prefix: string): boolean {
+  return prefix.length >= MIN_CODE_PREFIX_LENGTH
+    && prefix.length <= MAX_CODE_PREFIX_LENGTH
+    && CODE_PREFIX_PATTERN.test(prefix)
+}
+
+/**
+ * 前缀的非阻断提示（不阻止生成，只在弹窗里提醒店员）。
+ * 空数组表示没有可提示的。
+ */
+export function codePrefixHints(prefix: string): string[] {
+  if (!prefix) return []
+  const hints: string[] = []
+  if (/[0O1I]/.test(prefix)) {
+    hints.push('前缀含 0 / O / 1 / I，顾客口头报号时容易听串，建议换掉')
+  }
+  if (prefix.length > RECOMMENDED_CODE_PREFIX_LENGTH) {
+    hints.push(`前缀 ${prefix.length} 位，加上 ${COUPON_CODE_LENGTH} 位随机码共 ${prefix.length + COUPON_CODE_LENGTH} 位，店员输入容易出错`)
+  }
+  return hints
 }
 
 // ── 状态判定 ────────────────────────────────────────────────────────────────
@@ -122,6 +157,7 @@ export interface GenerateCouponInput {
   discountValue: number
   expiresOn:     string | null   // 伦敦当地 YYYY-MM-DD，null = 永久有效
   quantity:      number
+  codePrefix:    string          // 已规范化的大写活动前缀，未填时为 COUPON_CODE_PREFIX
 }
 
 export type GenerateValidation =
@@ -133,6 +169,7 @@ export function validateGenerateInput(raw: {
   discountValue?: unknown
   expiresOn?: unknown
   quantity?: unknown
+  codePrefix?: unknown
 }, now: Date = new Date()): GenerateValidation {
   const type = raw.discountType
   if (type !== 'fixed_amount' && type !== 'percentage_off' && type !== 'time_minutes') {
@@ -181,7 +218,24 @@ export function validateGenerateInput(raw: {
     return { ok: false, error: `生成数量必须是 ${MIN_GENERATE_QUANTITY} 到 ${MAX_GENERATE_QUANTITY} 之间的整数` }
   }
 
-  return { ok: true, value: { discountType: type, discountValue: value, expiresOn, quantity } }
+  // 活动前缀：只有「没填」（undefined / null / 空白字符串）才回退默认值；
+  // 填了错的东西（非字符串、非法字符、长度越界）一律拒绝，不静默吞掉。
+  const rawPrefix = raw.codePrefix
+  const prefixProvided = !(
+    rawPrefix === undefined
+    || rawPrefix === null
+    || (typeof rawPrefix === 'string' && rawPrefix.trim() === '')
+  )
+  const normalizedPrefix = normalizeCodePrefix(rawPrefix)
+  if (prefixProvided && !isValidCodePrefix(normalizedPrefix)) {
+    return {
+      ok: false,
+      error: `活动前缀只能是 ${MIN_CODE_PREFIX_LENGTH} 到 ${MAX_CODE_PREFIX_LENGTH} 位大写字母或数字`,
+    }
+  }
+  const codePrefix = prefixProvided ? normalizedPrefix : COUPON_CODE_PREFIX
+
+  return { ok: true, value: { discountType: type, discountValue: value, expiresOn, quantity, codePrefix } }
 }
 
 // ── 优惠计算 / 预验证 ───────────────────────────────────────────────────────

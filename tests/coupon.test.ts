@@ -2,12 +2,16 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { calcBill } from '../lib/timer/pricing.ts'
 import {
+  COUPON_CODE_LENGTH,
+  codePrefixHints,
   computeSettlement,
   couponStatus,
   describeDiscount,
+  isValidCodePrefix,
   isValidDateString,
   londonEndOfDayToUtcIso,
   londonToday,
+  normalizeCodePrefix,
   normalizeCouponCode,
   toPence,
   validateGenerateInput,
@@ -229,14 +233,30 @@ test('日期与伦敦当日判断', () => {
 
 // ── 优惠码生成 ──────────────────────────────────────────────────────────────
 
-test('优惠码格式：TD 前缀 + 8 位，且不含易混淆字符', () => {
+test('优惠码格式：默认 TD 前缀 + 5 位，且不含易混淆字符', () => {
   const code = generateCouponCode()
-  assert.match(code, /^TD[A-Z2-9]{8}$/)
-  assert.equal(code.length, 10)
+  assert.match(code, /^TD[A-Z2-9]{5}$/)
+  assert.equal(code.length, 7)
   for (const ch of code.slice(2)) {
     assert.ok(COUPON_CODE_ALPHABET.includes(ch), `${ch} 不在字符集中`)
   }
   assert.equal(/[0O1I]/.test(code), false)
+})
+
+test('优惠码格式：自定义活动前缀加 5 位随机后缀', () => {
+  const welcome = generateCouponCode('WELCOME')
+  assert.match(welcome, /^WELCOME[A-Z2-9]{5}$/)
+  assert.equal(welcome.length, 12)
+
+  const lucky = generateCouponCode('LUCKY')
+  assert.match(lucky, /^LUCKY[A-Z2-9]{5}$/)
+})
+
+test('批量生成：指定前缀时全部带该前缀且互不重复', () => {
+  const codes = generateCouponCodes(500, 'WELCOME')
+  assert.equal(codes.length, 500)
+  assert.equal(new Set(codes).size, 500)
+  for (const c of codes) assert.match(c, /^WELCOME[A-Z2-9]{5}$/)
 })
 
 test('批量生成的优惠码互不重复', () => {
@@ -245,8 +265,85 @@ test('批量生成的优惠码互不重复', () => {
   assert.equal(new Set(codes).size, 500)
 })
 
+test('批量生成不传前缀时沿用默认 TD（向后兼容）', () => {
+  for (const c of generateCouponCodes(20)) assert.match(c, /^TD[A-Z2-9]{5}$/)
+})
+
 test('便士换算按分四舍五入', () => {
   assert.equal(toPence(13.99), 1399)
   assert.equal(toPence(19.985), 1999)
   assert.equal(toPence(0.005), 1)
+})
+
+// ── 活动前缀 ────────────────────────────────────────────────────────────────
+
+test('前缀规范化：去首尾空格 + 转大写，非字符串返回空串', () => {
+  assert.equal(normalizeCodePrefix('  welcome '), 'WELCOME')
+  assert.equal(normalizeCodePrefix('lucky'), 'LUCKY')
+  assert.equal(normalizeCodePrefix(undefined), '')
+  assert.equal(normalizeCodePrefix(null), '')
+  assert.equal(normalizeCodePrefix(123), '')
+})
+
+test('前缀合法性：2-8 位大写字母数字', () => {
+  assert.equal(isValidCodePrefix('AB'), true)
+  assert.equal(isValidCodePrefix('ABCDEFGH'), true)   // 8 位上限
+  assert.equal(isValidCodePrefix('WELCOME'), true)
+  assert.equal(isValidCodePrefix('AB12'), true)
+
+  assert.equal(isValidCodePrefix('A'), false)          // 太短
+  assert.equal(isValidCodePrefix('ABCDEFGHI'), false)  // 9 位太长
+  assert.equal(isValidCodePrefix('WELCOME!'), false)   // 非法字符
+  assert.equal(isValidCodePrefix('wel come'), false)   // 含空格
+  assert.equal(isValidCodePrefix('中秋'), false)        // 中文
+  assert.equal(isValidCodePrefix(''), false)
+})
+
+test('前缀提示：易混淆字符与超长前缀会给非阻断提示', () => {
+  // 不含 O / I、且不超过 5 位的活动名没有提示
+  assert.deepEqual(codePrefixHints('LUCKY'), [])
+  assert.deepEqual(codePrefixHints('MERRY'), [])
+  assert.deepEqual(codePrefixHints(''), [])
+
+  // 含 O / 0 / 1 / I 会给易混淆提示（PRD 自己的例子 WELCOME 就含 O，所以也会触发）
+  for (const prefix of ['WEL0', 'MIDI', 'A1', 'WELCOME']) {
+    const ambiguous = codePrefixHints(prefix).filter(h => /0 \/ O \/ 1 \/ I/.test(h))
+    assert.equal(ambiguous.length, 1, `${prefix} 应给一条易混淆提示`)
+  }
+
+  // 超过 5 位会给总长度提示
+  const long = codePrefixHints('WELCOME').filter(h => /共 12 位/.test(h))
+  assert.equal(long.length, 1)
+  assert.match(long[0], /7 位/)
+
+  // 两条都可能同时出现：LONGONE 7 位且含 O
+  assert.equal(codePrefixHints('LONGONE').length, 2)
+})
+
+test('生成参数：前缀留空回退默认 TD', () => {
+  for (const raw of [undefined, null, '', '   ']) {
+    const res = validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 1, codePrefix: raw }, TODAY)
+    assert.equal(res.ok, true, `${JSON.stringify(raw)} 应回退默认值`)
+    if (res.ok) assert.equal(res.value.codePrefix, 'TD')
+  }
+})
+
+test('生成参数：前缀自动转大写去空格', () => {
+  const res = validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 1, codePrefix: ' welcome ' }, TODAY)
+  assert.equal(res.ok, true)
+  if (res.ok) assert.equal(res.value.codePrefix, 'WELCOME')
+})
+
+test('生成参数：非法前缀被拒绝', () => {
+  for (const raw of ['A', 'ABCDEFGHI', 'WELCOME!', 'WEL COME', '中秋', 123, 'WE-LCOME']) {
+    const res = validateGenerateInput({ discountType: 'fixed_amount', discountValue: 2, expiresOn: null, quantity: 1, codePrefix: raw }, TODAY)
+    assert.equal(res.ok, false, `${JSON.stringify(raw)} 应被拒绝`)
+    if (!res.ok) assert.equal(res.error, '活动前缀只能是 2 到 8 位大写字母或数字')
+  }
+})
+
+test('后缀长度为 5 位（PRD v1.1 由 8 位下调，撞码仍由唯一索引兜底）', () => {
+  assert.equal(COUPON_CODE_LENGTH, 5)
+  const code = generateCouponCode('AB')
+  assert.equal(code.length, 2 + COUPON_CODE_LENGTH)
 })

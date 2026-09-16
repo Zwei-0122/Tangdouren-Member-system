@@ -24,6 +24,7 @@ export async function GET(request: NextRequest) {
     ? statusParam as StatusFilter
     : 'all'
   const search   = (searchParams.get('search') ?? '').trim().toUpperCase()
+  const prefix   = (searchParams.get('prefix') ?? '').trim().toUpperCase()
   const page     = Math.max(1, parseInt(searchParams.get('page') ?? '1', 10) || 1)
   const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(searchParams.get('pageSize') ?? String(DEFAULT_PAGE_SIZE), 10) || DEFAULT_PAGE_SIZE))
 
@@ -36,6 +37,7 @@ export async function GET(request: NextRequest) {
     .order('created_at', { ascending: false })
 
   if (search) query = query.ilike('code', `%${search}%`)
+  if (prefix) query = query.eq('code_prefix', prefix)
 
   if (status === 'unused') {
     query = query.is('redeemed_at', null).or(`expires_at.is.null,expires_at.gte.${now}`)
@@ -54,16 +56,22 @@ export async function GET(request: NextRequest) {
   }
 
   // 简单统计（不受分页/筛选影响，覆盖全表）
-  const [totalRes, redeemedRes, expiredRes] = await Promise.all([
+  const [totalRes, redeemedRes, expiredRes, prefixRes] = await Promise.all([
     admin.from('coupons').select('*', { count: 'exact', head: true }),
     admin.from('coupons').select('*', { count: 'exact', head: true }).not('redeemed_at', 'is', null),
     admin.from('coupons').select('*', { count: 'exact', head: true }).is('redeemed_at', null).lt('expires_at', now),
+    // 已用前缀列表（使用张数 + 最近使用时间），供生成弹窗快捷复用
+    admin.rpc('coupon_prefix_usage'),
   ])
 
   const total    = totalRes.count    ?? 0
   const redeemed = redeemedRes.count ?? 0
   const expired  = expiredRes.count  ?? 0
   const available = Math.max(0, total - redeemed - expired)
+
+  if (prefixRes.error) {
+    console.error('[GET /api/admin/coupons] coupon_prefix_usage', prefixRes.error.message)
+  }
 
   return NextResponse.json({
     coupons:   data ?? [],
@@ -72,6 +80,7 @@ export async function GET(request: NextRequest) {
     total:     count ?? 0,
     totalPages: Math.max(1, Math.ceil((count ?? 0) / pageSize)),
     stats:     { total, available, redeemed, expired },
+    usedPrefixes: prefixRes.error ? [] : (prefixRes.data ?? []),
   })
 }
 
@@ -82,14 +91,14 @@ export async function POST(request: NextRequest) {
   const { data: { user } } = await supabase.auth.getUser()
   if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
 
-  let body: { discountType?: unknown; discountValue?: unknown; expiresOn?: unknown; quantity?: unknown }
+  let body: { discountType?: unknown; discountValue?: unknown; expiresOn?: unknown; quantity?: unknown; codePrefix?: unknown }
   try { body = await request.json() } catch {
     return NextResponse.json({ error: '请求格式错误' }, { status: 400 })
   }
 
   const validation = validateGenerateInput(body)
   if (!validation.ok) return NextResponse.json({ error: validation.error }, { status: 400 })
-  const { discountType, discountValue, expiresOn, quantity } = validation.value
+  const { discountType, discountValue, expiresOn, quantity, codePrefix } = validation.value
 
   let expiresAt: string | null = null
   if (expiresOn) {
@@ -102,11 +111,12 @@ export async function POST(request: NextRequest) {
 
   // 随机码碰撞概率极低，但仍以数据库唯一约束兜底：冲突时换一批重试
   for (let attempt = 0; attempt < 3; attempt++) {
-    const codes = generateCouponCodes(quantity)
+    const codes = generateCouponCodes(quantity, codePrefix)
     const { data, error } = await admin
       .from('coupons')
       .insert(codes.map(code => ({
         code,
+        code_prefix:    codePrefix,
         discount_type:  discountType,
         discount_value: discountValue,
         expires_at:     expiresAt,

@@ -4,11 +4,16 @@ import { useCallback, useEffect, useState } from 'react'
 import Link from 'next/link'
 import Sidebar from '@/components/admin/Sidebar'
 import {
+  COUPON_CODE_LENGTH,
   COUPON_STATUS_LABELS,
+  MAX_CODE_PREFIX_LENGTH,
   MAX_GENERATE_QUANTITY,
+  MIN_CODE_PREFIX_LENGTH,
   TIME_COUPON_STEP_MINUTES,
+  codePrefixHints,
   couponStatus,
   describeDiscount,
+  isValidCodePrefix,
   londonToday,
   type CouponStatus,
   type DiscountType,
@@ -17,6 +22,7 @@ import {
 interface Coupon {
   coupon_id:           string
   code:                string
+  code_prefix:         string
   discount_type:       DiscountType
   discount_value:      number
   expires_at:          string | null
@@ -25,6 +31,13 @@ interface Coupon {
   redeemed_session_id: string | null
   created_by:          string
   created_at:          string
+}
+
+/** 已用前缀（GET 里由 coupon_prefix_usage() 聚合返回） */
+interface UsedPrefix {
+  code_prefix:     string
+  uses:            number
+  last_created_at: string | null
 }
 
 interface CouponStats {
@@ -71,6 +84,8 @@ export default function CouponsPage() {
   const [totalPages, setTotal]  = useState(1)
   const [total, setTotalRows]   = useState(0)
   const [status, setStatus]     = useState<string>('all')
+  const [prefixFilter, setPrefixFilter] = useState('')
+  const [usedPrefixes, setUsedPrefixes] = useState<UsedPrefix[]>([])
   const [searchInput, setSearchInput] = useState('')
   const [search, setSearch]     = useState('')
   const [copied, setCopied]     = useState('')
@@ -83,6 +98,7 @@ export default function CouponsPage() {
     permanent:     true,
     expiresOn:     londonToday(),
     quantity:      '1',
+    codePrefix:    '',
   })
   const [generating, setGenerating] = useState(false)
   const [formError, setFormError]   = useState('')
@@ -95,18 +111,21 @@ export default function CouponsPage() {
       pageSize: String(PAGE_SIZE),
       status,
       search,
+      prefix:   prefixFilter,
     })
     const res  = await fetch(`/api/admin/coupons?${params.toString()}`)
     const data = await res.json() as {
-      coupons?: Coupon[]; stats?: CouponStats; totalPages?: number; total?: number; error?: string
+      coupons?: Coupon[]; stats?: CouponStats; totalPages?: number; total?: number
+      usedPrefixes?: UsedPrefix[]; error?: string
     }
     if (!res.ok) { alert(data.error ?? '读取优惠券失败'); setLoading(false); return }
     setCoupons(data.coupons ?? [])
     setStats(data.stats ?? { total: 0, available: 0, redeemed: 0, expired: 0 })
     setTotal(data.totalPages ?? 1)
     setTotalRows(data.total ?? 0)
+    setUsedPrefixes(data.usedPrefixes ?? [])
     setLoading(false)
-  }, [page, status, search])
+  }, [page, status, search, prefixFilter])
 
   useEffect(() => { load() }, [load]) // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -126,9 +145,10 @@ export default function CouponsPage() {
   }
 
   function downloadCsv(rows: Coupon[], filename: string) {
-    const header = ['code', 'discount_type', 'discount_value', 'expires_at', 'created_at', 'content']
+    const header = ['code', 'code_prefix', 'discount_type', 'discount_value', 'expires_at', 'created_at', 'content']
     const lines  = rows.map(c => [
       c.code,
+      c.code_prefix,
       c.discount_type,
       c.discount_value,
       c.expires_at ?? '',
@@ -160,6 +180,13 @@ export default function CouponsPage() {
     }
     if (!form.permanent && !form.expiresOn) { setFormError('请选择截止日期'); return }
 
+    // 留空 = 用默认前缀 TD（与旧行为一致）
+    const codePrefix = form.codePrefix.trim().toUpperCase()
+    if (codePrefix !== '' && !isValidCodePrefix(codePrefix)) {
+      setFormError(`活动前缀只能是 ${MIN_CODE_PREFIX_LENGTH} 到 ${MAX_CODE_PREFIX_LENGTH} 位大写字母或数字`)
+      return
+    }
+
     setGenerating(true)
     try {
       const res = await fetch('/api/admin/coupons', {
@@ -170,6 +197,7 @@ export default function CouponsPage() {
           discountValue: value,
           expiresOn:     form.permanent ? null : form.expiresOn,
           quantity,
+          codePrefix,
         }),
       })
       const data = await res.json() as { coupons?: Coupon[]; error?: string }
@@ -189,6 +217,18 @@ export default function CouponsPage() {
   const unitLabel = form.discountType === 'fixed_amount' ? '英镑（£）'
     : form.discountType === 'percentage_off' ? '减免百分比（%）' : '减免分钟数'
 
+  // 前缀实时预览与提示：弹窗里只做提示，不阻断（校验在提交时做）
+  const prefixInput    = form.codePrefix.trim().toUpperCase()
+  const prefixHints    = codePrefixHints(prefixInput)
+  const prefixEffective = prefixInput === '' ? 'TD' : prefixInput
+
+  function openForm(codePrefix = '') {
+    setGenerated(null)
+    setFormError('')
+    setForm(f => ({ ...f, codePrefix }))
+    setShowForm(true)
+  }
+
   return (
     <div className="min-h-screen bg-stone-50">
       <Sidebar active="/dashboard/coupons" />
@@ -202,7 +242,7 @@ export default function CouponsPage() {
               <p className="text-xs text-stone-400 mt-0.5">单次核销，每笔计时订单最多使用一张</p>
             </div>
             <button
-              onClick={() => { setGenerated(null); setFormError(''); setShowForm(true) }}
+              onClick={() => openForm()}
               className="px-4 py-2 bg-terracotta text-white rounded-xl text-sm font-medium hover:bg-terracotta/90 transition shadow-sm"
             >
               ＋ 生成优惠券
@@ -297,13 +337,41 @@ export default function CouponsPage() {
             </div>
           </div>
 
+          {/* 前缀筛选（点一下只看某个活动的券） */}
+          {(usedPrefixes.length > 0 || prefixFilter !== '') && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-xs text-stone-400">活动前缀</span>
+              <button
+                onClick={() => { setPrefixFilter(''); setPage(1) }}
+                className={`px-3 py-1 rounded-full text-xs font-medium transition ${prefixFilter === '' ? 'bg-terracotta text-white' : 'bg-white text-stone-500 border border-stone-200 hover:border-terracotta/40'}`}
+              >
+                全部
+              </button>
+              {usedPrefixes.map(p => (
+                <button
+                  key={p.code_prefix}
+                  onClick={() => { setPrefixFilter(p.code_prefix); setPage(1) }}
+                  title={`${p.uses} 张 · 最近 ${formatLondon(p.last_created_at)}`}
+                  className={`px-3 py-1 rounded-full text-xs font-mono font-medium transition ${prefixFilter === p.code_prefix ? 'bg-terracotta text-white' : 'bg-white text-stone-500 border border-stone-200 hover:border-terracotta/40'}`}
+                >
+                  {p.code_prefix}<span className="opacity-60 font-sans"> {p.uses}</span>
+                </button>
+              ))}
+              {prefixFilter !== '' && !usedPrefixes.some(p => p.code_prefix === prefixFilter) && (
+                <span className="px-3 py-1 rounded-full text-xs font-mono font-medium bg-terracotta text-white">
+                  {prefixFilter}
+                </span>
+              )}
+            </div>
+          )}
+
           {/* 列表 */}
           {loading ? (
             <div className="text-center py-12 text-stone-400">加载中…</div>
           ) : coupons.length === 0 ? (
             <div className="text-center py-12 text-stone-400">
               <p className="text-3xl mb-2">🎟</p>
-              <p>{status === 'all' && !search ? '还没有优惠券，点上方「生成优惠券」开始' : '没有符合条件的优惠券'}</p>
+              <p>{status === 'all' && !search && !prefixFilter ? '还没有优惠券，点上方「生成优惠券」开始' : '没有符合条件的优惠券'}</p>
             </div>
           ) : (
             <div className="space-y-2">
@@ -325,6 +393,19 @@ export default function CouponsPage() {
                           <span className={`text-xs px-2 py-0.5 rounded-full border font-medium ${statusChip[st]}`}>
                             {COUPON_STATUS_LABELS[st]}
                           </span>
+                          <span
+                            className="text-xs px-2 py-0.5 rounded-full border border-stone-200 bg-stone-50 text-stone-500 font-mono"
+                            title="活动前缀"
+                          >
+                            {c.code_prefix}
+                          </span>
+                          <button
+                            onClick={() => openForm(c.code_prefix)}
+                            className="text-xs text-terracotta/80 hover:text-terracotta hover:underline"
+                            title={`用前缀 ${c.code_prefix} 再生成一批`}
+                          >
+                            再生成一批
+                          </button>
                         </div>
                         <p className="text-sm text-terracotta font-medium mt-1">
                           {describeDiscount(c.discount_type, c.discount_value)}
@@ -382,6 +463,55 @@ export default function CouponsPage() {
             onClick={e => e.stopPropagation()}
           >
             <p className="text-base font-semibold text-stone-800 mb-4">生成优惠券</p>
+
+            {/* 活动前缀 */}
+            <div className="mb-4">
+              <div className="flex items-center justify-between mb-1">
+                <label className="block text-xs text-stone-400">活动前缀（选填）</label>
+                {form.codePrefix !== '' && (
+                  <button
+                    onClick={() => setForm(f => ({ ...f, codePrefix: '' }))}
+                    className="text-xs text-stone-400 hover:text-stone-600"
+                  >
+                    清空
+                  </button>
+                )}
+              </div>
+              <input
+                className={inputCls + ' font-mono'}
+                placeholder="留空 = TD"
+                maxLength={MAX_CODE_PREFIX_LENGTH}
+                value={form.codePrefix}
+                onChange={e => setForm(f => ({ ...f, codePrefix: e.target.value.toUpperCase() }))}
+              />
+              {usedPrefixes.length > 0 && (
+                <div className="flex items-center gap-1.5 flex-wrap mt-2">
+                  <span className="text-xs text-stone-400 shrink-0">用过的</span>
+                  {usedPrefixes.map(p => (
+                    <button
+                      key={p.code_prefix}
+                      onClick={() => setForm(f => ({ ...f, codePrefix: p.code_prefix }))}
+                      title={`${p.uses} 张 · 最近 ${formatLondon(p.last_created_at)}`}
+                      className={`px-2 py-0.5 rounded-full text-xs font-mono border transition ${prefixInput === p.code_prefix ? 'bg-terracotta text-white border-terracotta' : 'bg-white text-stone-600 border-stone-200 hover:border-terracotta/40'}`}
+                    >
+                      {p.code_prefix}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {prefixInput !== '' && !isValidCodePrefix(prefixInput) && (
+                <p className="text-xs text-red-500 mt-1">
+                  前缀只能是 {MIN_CODE_PREFIX_LENGTH} 到 {MAX_CODE_PREFIX_LENGTH} 位大写字母或数字
+                </p>
+              )}
+              {prefixHints.map(h => (
+                <p key={h} className="text-xs text-amber-600 mt-1">{h}</p>
+              ))}
+              <p className="text-xs text-stone-400 mt-1">
+                券码 = 活动前缀 + {COUPON_CODE_LENGTH} 位随机后缀，例如 <span className="font-mono">{prefixEffective}7K2QP</span>。
+                后缀随机生成，不做顺序号。
+              </p>
+            </div>
 
             {/* 优惠类型 */}
             <p className="text-xs text-stone-400 mb-2">优惠类型</p>
