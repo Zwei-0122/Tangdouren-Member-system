@@ -234,9 +234,15 @@ BEGIN
         IF v_reward_type IN ('TWO_POUND', 'FIVE_POUND') THEN
           -- 内部券：券码由 reward_id 派生，天然唯一，不需要随机数与重试。
           -- 顾客看不到这个码（PRD 9），它只是结算台核销的凭据。
-          INSERT INTO coupons (code, discount_type, discount_value, created_by)
+          -- code_prefix 必须显式写：015 的 coupons_code_prefix_check 要求
+          -- left(code, length(code_prefix)) = code_prefix，而该列默认值是 'TD'，
+          -- 不写就会拿默认值去比 'MB' 开头的券码，直接被约束拒掉。
+          -- 用 MB 前缀的另一个好处：活动报表（coupon_prefix_usage）里会员内部券
+          -- 与店员手工发的 TD 券分开统计。
+          INSERT INTO coupons (code, code_prefix, discount_type, discount_value, created_by)
           VALUES (
             'MB' || upper(substr(replace(v_reward_id::text, '-', ''), 1, 16)),
+            'MB',
             'fixed_amount',
             CASE v_reward_type WHEN 'TWO_POUND' THEN 2.00 ELSE 5.00 END,
             'member_reward'
