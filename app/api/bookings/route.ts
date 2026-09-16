@@ -10,6 +10,7 @@ import { sendEmail } from '@/lib/email/sender'
 import { buildConfirmationEmail } from '@/lib/email/templates/confirmation'
 import { generateCancelToken, buildCancelUrl } from '@/lib/token/cancelToken'
 import { notifyAdminNewBooking } from '@/lib/email/notifyAdmin'
+import { ensureMember } from '@/lib/member/service'
 
 // ── POST /api/bookings — 提交新预约 ───────────────────────────────────────────
 
@@ -26,6 +27,8 @@ const BookingSchema = z.object({
   email:           z.string().email('请输入有效的邮箱地址').max(100),
   remark:          z.string().max(500).optional(),
   lang:            z.enum(['zh', 'en']).optional().default('zh'),
+  // 勾选「加入 Tangdouren Club」：随预约一起建会员，不等支付结果（PRD 2.3）
+  joinClub:        z.boolean().optional().default(false),
 })
 
 export async function POST(request: NextRequest) {
@@ -39,7 +42,24 @@ export async function POST(request: NextRequest) {
     }
 
     const supabase = createAdminClient()
-    const result   = await createBooking(parsed.data, supabase)
+    // joinClub 只用于会员，不进 bookings 表
+    const { joinClub, ...bookingInput } = parsed.data
+    const result   = await createBooking(bookingInput, supabase)
+
+    // 勾选了加入会员就在这里建，失败也不连累预约本身
+    let memberJoined = false
+    if (joinClub) {
+      try {
+        const { member } = await ensureMember(supabase, {
+          email:         parsed.data.email,
+          displayName:   parsed.data.customerName,
+          consentSource: 'booking',
+        })
+        memberJoined = member.is_active
+      } catch (memberErr) {
+        console.error('[POST /api/bookings] 加入会员失败:', memberErr instanceof Error ? memberErr.message : memberErr)
+      }
+    }
 
     // ── 支付关闭：直接确认预约，发送确认邮件 ──────────────────────────────────
     if (!PAYMENT_ENABLED) {
@@ -92,10 +112,10 @@ export async function POST(request: NextRequest) {
         source:       '顾客在线预约',
       })
 
-      return NextResponse.json({ ...result, confirmed: true, depositAmount: 0 }, { status: 201 })
+      return NextResponse.json({ ...result, confirmed: true, depositAmount: 0, memberJoined }, { status: 201 })
     }
 
-    return NextResponse.json(result, { status: 201 })
+    return NextResponse.json({ ...result, memberJoined }, { status: 201 })
 
   } catch (err: unknown) {
     if (err instanceof BookingError) {

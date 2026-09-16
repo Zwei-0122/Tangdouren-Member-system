@@ -18,6 +18,7 @@ interface TimerSession {
   booking_id:      string | null
   table_number:    string | null
   created_via:     'admin' | 'booking' | 'self_service' | null
+  member?:         { display_name: string | null; email: string } | null
 }
 
 function calcLiveElapsed(s: TimerSession): number {
@@ -223,6 +224,11 @@ export default function TimersListPage() {
                           {s.table_number && (
                             <span className="text-xs px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 font-medium shrink-0">
                               {s.table_number}
+                            </span>
+                          )}
+                          {s.member && (
+                            <span className="text-xs px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 font-medium shrink-0 truncate max-w-[9rem]">
+                              {s.member.display_name ?? s.member.email}
                             </span>
                           )}
                           <span className={`text-xs px-2 py-0.5 rounded-full font-medium shrink-0 ${meta.color}`}>

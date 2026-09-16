@@ -98,7 +98,8 @@ export default function BookingPage() {
   const [selectedOption, setSelectedOption] = useState<{
     startTime: string; durationMinutes: number; displayTag: string
   } | null>(null)
-  const [form, setForm]         = useState({ name: '', email: '', remark: '' })
+  const [form, setForm]         = useState({ name: '', email: '', remark: '', joinClub: false })
+  const [memberJoined, setMemberJoined] = useState(false)
   const [formErrors, setErrors] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
   const [submitError, setSubmitError] = useState('')
@@ -207,11 +208,13 @@ export default function BookingPage() {
           durationMinutes: selectedOption.durationMinutes,
           customerName: form.name, email: form.email,
           remark: form.remark || undefined,
+          joinClub: form.joinClub,
           lang,
         }),
       })
       const bookingData = await bookingRes.json()
       if (!bookingRes.ok) { setSubmitError(bookingData.error ?? p(t.step4NetworkErr)); return }
+      setMemberJoined(Boolean(bookingData.memberJoined))
 
       setBookingResult({
         bookingId: bookingData.bookingId,
@@ -246,7 +249,7 @@ export default function BookingPage() {
   function resetAll() {
     setStep('date'); setDate(null); setPartySize(1); setSharing(false)
     setPickedTime(null); setAvailability([]); setSelectedOption(null)
-    setForm({ name: '', email: '', remark: '' })
+    setForm({ name: '', email: '', remark: '', joinClub: false })
     setErrors({}); setSubmitError(''); setBookingResult(null)
   }
 
@@ -634,6 +637,19 @@ export default function BookingPage() {
                     {formErrors.email && <p className="mt-1 text-xs text-red-500">{formErrors.email}</p>}
                   </div>
 
+                  <label className="flex items-start gap-3 rounded-2xl border border-sand-200 bg-warm-50 p-4">
+                    <input
+                      type="checkbox"
+                      className="mt-1"
+                      checked={form.joinClub}
+                      onChange={e => setForm({ ...form, joinClub: e.target.checked })}
+                    />
+                    <span>
+                      <span className="block text-sm font-medium text-charcoal">{p(t.step4JoinClub)}</span>
+                      <span className="mt-1 block text-xs leading-5 text-charcoal-light">{p(t.step4JoinClubHint)}</span>
+                    </span>
+                  </label>
+
                   <div>
                     <label className="label" htmlFor="remark">{p(t.step4RemarkLabel)}</label>
                     <textarea id="remark" rows={3}
@@ -684,6 +700,12 @@ export default function BookingPage() {
             <h2 className="font-display text-2xl font-bold text-charcoal mb-2">{p(t.step5Title)}</h2>
             <p className="text-charcoal-light mb-2">{p(t.step5Subtitle)}</p>
             <p className="text-sm text-charcoal-light/60 mb-8">{p(t.step5SubNote)}</p>
+
+            {memberJoined && (
+              <div className="rounded-2xl bg-sage/10 border border-sage/30 px-4 py-3 text-sm text-charcoal mb-4">
+                {p(t.step5MemberJoined)}
+              </div>
+            )}
 
             <div className="rounded-2xl bg-warm-50 border border-sand-200 p-4 text-sm text-left space-y-2 mb-6">
               <p className="font-semibold text-charcoal mb-2">{p(t.step5DetailsTitle)}</p>

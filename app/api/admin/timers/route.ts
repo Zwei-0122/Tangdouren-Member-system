@@ -89,5 +89,22 @@ export async function GET(request: NextRequest) {
   const { data, error } = await query
   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
 
-  return NextResponse.json({ sessions: data })
+  // 会员信息单独查一次，不做 join：迁移还没上的环境里 timer_sessions 没有 member_id 列，
+  // 直接 join members 会让整个列表报错。取到 member_id 才查，取不到就跳过。
+  const rows = (data ?? []) as { member_id?: string | null }[]
+  const memberIds = [...new Set(rows.map(r => r.member_id).filter((v): v is string => Boolean(v)))]
+  const memberById = new Map<string, { display_name: string | null; email: string }>()
+  if (memberIds.length > 0) {
+    const { data: members } = await admin
+      .from('members')
+      .select('member_id, display_name, email')
+      .in('member_id', memberIds)
+    for (const m of members ?? []) {
+      memberById.set(m.member_id as string, { display_name: m.display_name as string | null, email: m.email as string })
+    }
+  }
+
+  return NextResponse.json({
+    sessions: rows.map(r => ({ ...r, member: r.member_id ? memberById.get(r.member_id) ?? null : null })),
+  })
 }

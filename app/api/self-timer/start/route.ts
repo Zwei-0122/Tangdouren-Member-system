@@ -9,6 +9,10 @@ const StartSchema = z.object({
   customerName: z.string().min(1).max(50),
   confirmNoMixedBeans: z.boolean(),
   idempotencyKey: z.string().min(8).max(120).optional(),
+  // 允许留空：空字符串等于「不以会员身份开始」，不能因此阻断普通计时
+  memberEmail: z.string().max(100).optional()
+    .transform(v => (v && v.trim() ? v.trim() : undefined))
+    .refine(v => v === undefined || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v), '邮箱格式不正确'),
 })
 
 function messageForError(error: unknown): { message: string; status: number } {

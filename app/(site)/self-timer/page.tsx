@@ -6,8 +6,10 @@ import { ZoomIn } from 'lucide-react'
 import { useLanguage } from '@/lib/i18n/LanguageContext'
 import { getSeatOptionsForTable, SELF_SERVICE_TABLE_CODES } from '@/lib/timer/selfServiceCore'
 import ImageLightbox from '@/components/site/ImageLightbox'
+import { forgetMember, readRememberedMember, rememberMember, type RememberedMember } from '@/lib/member/client'
 
-type Phase = 'home' | 'tutorial' | 'form' | 'confirm' | 'lookup'
+// club / join / signin 是会员入口（PRD 3.3、4）；lookup 一直是「找回我的计时」，两者别混
+type Phase = 'home' | 'tutorial' | 'form' | 'confirm' | 'lookup' | 'club' | 'join' | 'signin'
 
 const SESSION_LS_KEY = 'tangdouren_self_timer_session_id'
 
@@ -39,13 +41,33 @@ const copy = {
     confirmStart: '确认并开始计时',
     starting: '正在开始…',
     contactStaff: '如需暂停或结束计时，请联系店员。',
-    guestOnly: '本期为本次体验计时；暂不收集邮箱或累计会员时长。',
+    guestOnly: '不填邮箱也能直接开始计时，只是这一次不会计入会员进度。',
     tapToZoom: '点击放大',
     lookupTitle: '查询我的计时',
     lookupHint: '选择开始计时时的座位号并填写名字，找回进行中的计时。',
     lookupNamePlaceholder: '开始计时时填写的名字',
     lookupSubmit: '查询',
     lookupNotFound: '未找到进行中的计时，请检查座位号与名字是否正确。',
+    club: 'Tangdouren Club',
+    clubIntro: '每次到店计时都会累积进度，满 2 次就有 £2 抵用券，满 10 次解锁 VIP Month。',
+    clubWelcome: (name: string) => `欢迎回来，${name}`,
+    clubContinue: (name: string) => `继续以 ${name} 的身份`,
+    clubSwitch: '换一个账户',
+    clubForget: '忘记这台设备上的账户',
+    clubSignin: '我是会员',
+    clubJoin: '确认加入',
+    clubSigninTitle: '会员登录',
+    clubSigninHint: '输入注册时用的邮箱即可识别，不需要会员号。',
+    clubJoinTitle: '加入会员',
+    clubConsent: '我同意 Tangdouren Club 会员条款',
+    clubSubmitJoin: '加入会员',
+    clubSubmitSignin: '继续',
+    clubSubmitting: '处理中…',
+    clubEmailLabel: '邮箱',
+    clubNameLabel: '称呼',
+    clubJoinHint: '注册后不会自动开始计时，你可以在会员首页点「以会员身份开始计时」。',
+    memberStarting: (name: string) => `正在以 ${name} 的会员身份计时`,
+    memberStartHint: '已经是会员？以会员身份开始',
   },
   en: {
     badge: 'In-store self timer',
@@ -72,13 +94,33 @@ const copy = {
     confirmStart: 'Confirm & Start Timer',
     starting: 'Starting…',
     contactStaff: 'Please contact staff if you need to pause or finish.',
-    guestOnly: 'This version is for one-off session timing only. Email collection and member history are not enabled yet.',
+    guestOnly: 'You can start without an email — the visit simply will not count towards membership progress.',
     tapToZoom: 'Tap to zoom',
     lookupTitle: 'Find my timer',
     lookupHint: 'Choose the seat number and enter the name you used when starting your timer.',
     lookupNamePlaceholder: 'The name you entered',
     lookupSubmit: 'Find',
     lookupNotFound: 'No active timer found. Please check the seat number and name.',
+    club: 'Tangdouren Club',
+    clubIntro: 'Every in-store visit builds your progress. Two visits unlock a £2 voucher, ten unlock a VIP Month.',
+    clubWelcome: (name: string) => `Welcome back, ${name}`,
+    clubContinue: (name: string) => `Continue as ${name}`,
+    clubSwitch: 'Use another account',
+    clubForget: 'Forget this account',
+    clubSignin: "I'm a Member",
+    clubJoin: 'Join the Club',
+    clubSigninTitle: 'Member sign in',
+    clubSigninHint: 'Enter the email you registered with. There is no membership number.',
+    clubJoinTitle: 'Join the Club',
+    clubConsent: 'I agree to the Tangdouren Club membership terms',
+    clubSubmitJoin: 'Join Club',
+    clubSubmitSignin: 'Continue',
+    clubSubmitting: 'Working…',
+    clubEmailLabel: 'Email',
+    clubNameLabel: 'Name',
+    clubJoinHint: 'Joining does not start your timer — tap “Start as Member” on your member page when you are ready.',
+    memberStarting: (name: string) => `Timer will count towards ${name}'s membership`,
+    memberStartHint: 'Already a member? Start as Member',
   },
 } as const
 
@@ -104,10 +146,16 @@ export default function SelfTimerPage() {
   const [lookupTable, setLookupTable] = useState('')
   const [lookupSeat, setLookupSeat] = useState('')
   const [lookupName, setLookupName] = useState('')
+  const [member, setMember] = useState<RememberedMember | null>(null)
+  const [clubName, setClubName] = useState('')
+  const [clubEmail, setClubEmail] = useState('')
+  const [clubConsent, setClubConsent] = useState(false)
   const idempotencyKey = useMemo(makeIdempotencyKey, [])
 
   useEffect(() => {
     try { setSavedSessionId(localStorage.getItem(SESSION_LS_KEY)) } catch {}
+    // 设备上记住的会员身份只用于少打一次邮箱，服务端每次都会重新查（PRD 4.3）
+    setMember(readRememberedMember())
     void fetch('/api/self-timer/tables', { cache: 'no-store' })
       .then(res => res.ok ? res.json() : null)
       .then((data: { tables?: string[] } | null) => {
@@ -130,12 +178,62 @@ export default function SelfTimerPage() {
       const res = await fetch('/api/self-timer/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ tableNumber, seatNumber, customerName, confirmNoMixedBeans: true, idempotencyKey }),
+        body: JSON.stringify({
+          tableNumber, seatNumber, customerName, confirmNoMixedBeans: true, idempotencyKey,
+          memberEmail: member?.email,
+        }),
       })
       const data = await res.json() as { sessionId?: string; error?: string }
       if (!res.ok || !data.sessionId) { setError(data.error ?? 'Start failed'); return }
       localStorage.setItem(SESSION_LS_KEY, data.sessionId)
       router.push(`/self-timer/session/${data.sessionId}`)
+    } finally { setLoading(false) }
+  }
+
+  async function joinClub() {
+    if (!clubName.trim()) { setError(lang === 'zh' ? '请填写称呼' : 'Please enter your name'); return }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clubEmail.trim())) {
+      setError(lang === 'zh' ? '请输入有效的邮箱地址' : 'Please enter a valid email address')
+      return
+    }
+    if (!clubConsent) { setError(c.clubConsent); return }
+
+    setError('')
+    setLoading(true)
+    try {
+      const res = await fetch('/api/member/join', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ name: clubName.trim(), email: clubEmail.trim(), consent: true }),
+      })
+      const data = await res.json().catch(() => ({})) as { member?: RememberedMember; error?: string }
+      if (!res.ok || !data.member) { setError(data.error ?? 'Join failed'); return }
+      const remembered = { ...data.member, email: clubEmail.trim() }
+      rememberMember(remembered)
+      setMember(remembered)
+      router.push('/self-timer/club')
+    } finally { setLoading(false) }
+  }
+
+  async function signinMember() {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clubEmail.trim())) {
+      setError(lang === 'zh' ? '请输入有效的邮箱地址' : 'Please enter a valid email address')
+      return
+    }
+    setError('')
+    setLoading(true)
+    try {
+      const res = await fetch('/api/member/lookup', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ email: clubEmail.trim() }),
+      })
+      const data = await res.json().catch(() => ({})) as { member?: RememberedMember; error?: string }
+      if (!res.ok || !data.member) { setError(data.error ?? 'Not a member'); return }
+      const remembered = { ...data.member, email: clubEmail.trim() }
+      rememberMember(remembered)
+      setMember(remembered)
+      router.push('/self-timer/club')
     } finally { setLoading(false) }
   }
 
@@ -183,6 +281,7 @@ export default function SelfTimerPage() {
             <button className="btn-primary w-full" onClick={() => setPhase('form')}>{c.start}</button>
             <button className="btn-secondary w-full" onClick={() => setPhase('tutorial')}>{c.tutorial}</button>
             <button className="btn-secondary w-full" onClick={() => { setError(''); setPhase('lookup') }}>{c.lookupTitle}</button>
+            <button className="btn-secondary w-full" onClick={() => { setError(''); setClubEmail(''); setPhase('club') }}>{c.club}</button>
             <p className="text-center text-xs text-stone-400">{c.contactStaff}</p>
           </div>
         )}
@@ -247,6 +346,17 @@ export default function SelfTimerPage() {
         {phase === 'form' && (
           <div className="card p-5 space-y-4">
             <p className="rounded-2xl bg-stone-50 px-4 py-3 text-xs leading-5 text-stone-500">{c.guestOnly}</p>
+            {member
+              ? <p className="rounded-2xl bg-terracotta/5 border border-terracotta/20 px-4 py-3 text-xs leading-5 text-charcoal">{c.memberStarting(member.display_name ?? member.email)}</p>
+              : (
+                <button
+                  type="button"
+                  className="w-full text-left text-xs font-medium text-terracotta underline"
+                  onClick={() => { setError(''); setClubEmail(''); setPhase('signin') }}
+                >
+                  {c.memberStartHint}
+                </button>
+              )}
             <div>
               <span className="label">{c.tableLabel}</span>
               <div className="mt-2 flex flex-wrap gap-2">
@@ -289,6 +399,64 @@ export default function SelfTimerPage() {
             </label>
             {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
             <button className="btn-primary w-full" onClick={() => { const msg = validateForm(); if (msg) setError(msg); else setPhase('confirm') }}>{c.continue}</button>
+          </div>
+        )}
+
+        {phase === 'club' && (
+          <div className="card p-5 space-y-4">
+            <h2 className="font-display text-xl font-semibold text-charcoal">{c.club}</h2>
+            <p className="text-sm leading-6 text-charcoal-light">{c.clubIntro}</p>
+            {member ? (
+              <>
+                <p className="rounded-2xl bg-stone-50 px-4 py-3 text-sm text-charcoal">{c.clubWelcome(member.display_name ?? member.email)}</p>
+                <button className="btn-primary w-full" onClick={() => router.push('/self-timer/club')}>{c.clubContinue(member.display_name ?? member.email)}</button>
+                <button className="btn-secondary w-full" onClick={() => { setError(''); setClubEmail(''); setPhase('signin') }}>{c.clubSwitch}</button>
+                <button className="btn-ghost w-full" onClick={() => { forgetMember(); setMember(null) }}>{c.clubForget}</button>
+              </>
+            ) : (
+              <>
+                <button className="btn-primary w-full" onClick={() => { setError(''); setPhase('join') }}>{c.clubJoin}</button>
+                <button className="btn-secondary w-full" onClick={() => { setError(''); setPhase('signin') }}>{c.clubSignin}</button>
+              </>
+            )}
+            {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
+            <button className="btn-ghost w-full" onClick={() => { setError(''); setPhase('home') }}>{c.confirmBack}</button>
+          </div>
+        )}
+
+        {phase === 'join' && (
+          <div className="card p-5 space-y-4">
+            <h2 className="font-display text-xl font-semibold text-charcoal">{c.clubJoinTitle}</h2>
+            <label className="block">
+              <span className="label">{c.clubNameLabel}</span>
+              <input className={inputCls} value={clubName} onChange={e => setClubName(e.target.value)} placeholder={c.namePlaceholder} />
+            </label>
+            <label className="block">
+              <span className="label">{c.clubEmailLabel}</span>
+              <input className={inputCls} type="email" inputMode="email" autoComplete="email" value={clubEmail} onChange={e => setClubEmail(e.target.value)} />
+            </label>
+            <label className="flex items-start gap-2 text-xs leading-5 text-charcoal-light">
+              <input type="checkbox" className="mt-0.5" checked={clubConsent} onChange={e => setClubConsent(e.target.checked)} />
+              <span>{c.clubConsent}</span>
+            </label>
+            <p className="text-xs leading-5 text-stone-400">{c.clubJoinHint}</p>
+            {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
+            <button className="btn-primary w-full" onClick={joinClub} disabled={loading}>{loading ? c.clubSubmitting : c.clubSubmitJoin}</button>
+            <button className="btn-ghost w-full" onClick={() => { setError(''); setPhase('club') }}>{c.confirmBack}</button>
+          </div>
+        )}
+
+        {phase === 'signin' && (
+          <div className="card p-5 space-y-4">
+            <h2 className="font-display text-xl font-semibold text-charcoal">{c.clubSigninTitle}</h2>
+            <p className="text-sm leading-6 text-charcoal-light">{c.clubSigninHint}</p>
+            <label className="block">
+              <span className="label">{c.clubEmailLabel}</span>
+              <input className={inputCls} type="email" inputMode="email" autoComplete="email" value={clubEmail} onChange={e => setClubEmail(e.target.value)} />
+            </label>
+            {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
+            <button className="btn-primary w-full" onClick={signinMember} disabled={loading}>{loading ? c.clubSubmitting : c.clubSubmitSignin}</button>
+            <button className="btn-ghost w-full" onClick={() => { setError(''); setPhase('club') }}>{c.confirmBack}</button>
           </div>
         )}
 
@@ -356,6 +524,7 @@ export default function SelfTimerPage() {
               <p>{c.tableLabel}: <strong className="text-charcoal">{tableNumber}</strong></p>
               <p>{c.seatLabel}: <strong className="text-charcoal">{seatNumber}</strong></p>
               <p>{c.name}: <strong className="text-charcoal">{customerName}</strong></p>
+              {member && <p className="mt-1 text-terracotta">{c.memberStarting(member.display_name ?? member.email)}</p>}
             </div>
             {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
             <button className="btn-primary w-full" onClick={startTimer} disabled={loading}>{loading ? c.starting : c.confirmStart}</button>

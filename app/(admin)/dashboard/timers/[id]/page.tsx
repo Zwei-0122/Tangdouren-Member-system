@@ -4,6 +4,7 @@ import { useEffect, useState, useRef, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { formatHMS, formatChineseDuration, calcBillingMinutes, calcBill, TIMER_PRICING } from '@/lib/timer/pricing'
 import { describeDiscount, type DiscountType } from '@/lib/coupon/coupon'
+import { computeMemberDiscount, type DiscountSource, type RewardType } from '@/lib/member/member'
 
 interface TimerSession {
   session_id:         string
@@ -30,6 +31,7 @@ interface TimerSession {
   settlement_note:    string | null
   settled_at:         string | null
   settled_by:         string | null
+  reward_eligible:    boolean | null
   // 优惠券快照字段
   coupon_id:                  string | null
   coupon_code_snapshot:       string | null
@@ -50,6 +52,24 @@ interface CouponPreview {
   discountAmountPence: number
 }
 
+// 结算台需要的那一小块会员信息（由 GET /api/admin/timers/[id] 一并返回）
+interface MemberSettleInfo {
+  member_id:           string
+  display_name:        string | null
+  email:               string
+  vip_active:          boolean
+  vip_expires_on:      string | null
+  usable_reward_types: RewardType[]
+}
+
+const memberRewardLabels: Record<RewardType, string> = {
+  TWO_POUND:       '£2 抵用券',
+  FIVE_POUND:      '£5 抵用券',
+  PERSONAL_15_OFF: '本人 85 折',
+  FRIEND_10_OFF:   '朋友 9 折',
+  VIP_MONTH:       'VIP Month',
+}
+
 function calcElapsed(session: TimerSession): number {
   if (session.status === 'idle') return 0
   if (session.status === 'completed' && session.elapsed_minutes !== null) return session.elapsed_minutes * 60
@@ -66,6 +86,7 @@ export default function AdminTimerDetailPage() {
   const { id }                = useParams<{ id: string }>()
   const router                = useRouter()
   const [session, setSession] = useState<TimerSession | null>(null)
+  const [member, setMember]   = useState<MemberSettleInfo | null>(null)
   const [elapsed, setElapsed] = useState(0)
   const [loading, setLoading] = useState(true)
   const [acting, setActing]   = useState(false)
@@ -76,8 +97,9 @@ export default function AdminTimerDetailPage() {
   const fetchSession = useCallback(async () => {
     const res  = await fetch(`/api/admin/timers/${id}`)
     if (!res.ok) { setError('找不到计时订单'); setLoading(false); return }
-    const data = await res.json() as { session: TimerSession }
+    const data = await res.json() as { session: TimerSession; member?: MemberSettleInfo | null }
     setSession(data.session)
+    setMember(data.member ?? null)
     setTableEdit(data.session.table_number ?? '')
     setElapsed(calcElapsed(data.session))
     setLoading(false)
@@ -307,7 +329,7 @@ export default function AdminTimerDetailPage() {
 
       {/* Settlement */}
       {isCompleted && (
-        <SettlementPanel session={session} onSettled={fetchSession} />
+        <SettlementPanel session={session} member={member} onSettled={fetchSession} />
       )}
 
       {/* Live bill preview (running) */}
@@ -367,13 +389,30 @@ export default function AdminTimerDetailPage() {
 
 // ── 结算面板 ─────────────────────────────────────────────────────────────────
 // 金额一律由服务端计算：优惠码只做预验证预览，确认结算时服务端重新校验并原子核销。
-function SettlementPanel({ session, onSettled }: { session: TimerSession; onSettled: () => void }) {
-  const [code,      setCode]      = useState('')
-  const [preview,   setPreview]   = useState<CouponPreview | null>(null)
-  const [note,      setNote]      = useState(session.settlement_note ?? '')
-  const [verifying, setVerifying] = useState(false)
-  const [saving,    setSaving]    = useState(false)
-  const [error,     setError]     = useState('')
+function SettlementPanel({ session, member, onSettled }: { session: TimerSession; member: MemberSettleInfo | null; onSettled: () => void }) {
+  const [code,       setCode]       = useState('')
+  const [preview,    setPreview]    = useState<CouponPreview | null>(null)
+  const [note,       setNote]       = useState(session.settlement_note ?? '')
+  const [verifying,  setVerifying]  = useState(false)
+  const [saving,     setSaving]     = useState(false)
+  const [error,      setError]      = useState('')
+  const [rewardType, setRewardType] = useState<RewardType | null>(null)
+
+  // VIP 生效期间系统强制走 VIP 85 折，店员不能改用其他会员奖励（PRD 11.4）
+  const vipActive = Boolean(member?.vip_active)
+
+  /** 会员折扣的预览。金额规则与数据库复核用的是同一套（lib/member/member.ts） */
+  const memberPreview = (() => {
+    if (!member) return null
+    const effective: DiscountSource = vipActive ? 'vip_month' : rewardType ? 'member_reward' : 'none'
+    if (effective === 'none') return null
+    const computed = computeMemberDiscount(effective, {
+      amountGbp:  session.amount_gbp,
+      vipActive,
+      rewardType,
+    })
+    return computed.ok ? computed.preview : null
+  })()
 
   const inputCls = 'w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta'
   const money    = (n: number | null | undefined) => n === null || n === undefined ? '—' : `£${n.toFixed(2)}`
@@ -412,6 +451,18 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
                 <span className="font-medium text-terracotta">−{money(session.discount_amount_gbp ?? 0)}</span>
               </div>
             </>
+          )}
+          {member && (
+            <div className="flex justify-between">
+              <span className="text-stone-500">会员</span>
+              <span className="font-medium text-stone-700">{member.display_name ?? member.email}</span>
+            </div>
+          )}
+          {session.reward_eligible === false && (
+            <div className="flex justify-between">
+              <span className="text-stone-500">本次进度</span>
+              <span className="font-medium text-amber-700">VIP 期间，不计入 Reward Progress</span>
+            </div>
           )}
           <div className="flex justify-between pt-1.5 border-t border-emerald-200">
             <span className="text-stone-500">实收</span>
@@ -470,7 +521,15 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
   }
 
   async function handleSettle() {
-    if (code.trim() && !preview) { setError('请先点击「验证」确认优惠码'); return }
+    // 一次结算只能有一个折扣来源（PRD 21）
+    const effectiveSource: DiscountSource = vipActive
+      ? 'vip_month'
+      : rewardType
+        ? 'member_reward'
+        : code.trim() ? 'coupon' : 'none'
+
+    if (effectiveSource === 'coupon' && !preview) { setError('请先点击「验证」确认优惠码'); return }
+    if (effectiveSource === 'member_reward' && !memberPreview) { setError('该会员奖励当前不可用'); return }
     setError('')
     setSaving(true)
     try {
@@ -479,7 +538,9 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           action:          'settle',
-          coupon_code:     code.trim() ? code.trim().toUpperCase() : undefined,
+          coupon_code:     effectiveSource === 'coupon' ? code.trim().toUpperCase() : undefined,
+          discount_source: effectiveSource,
+          reward_type:     effectiveSource === 'member_reward' ? rewardType : undefined,
           settlement_note: note || null,
         }),
       })
@@ -515,7 +576,7 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
   }
 
   const originalGbp = session.amount_gbp ?? 0
-  const finalGbp    = preview ? preview.finalGbp : originalGbp
+  const finalGbp    = preview ? preview.finalGbp : memberPreview ? memberPreview.finalGbp : originalGbp
 
   return (
     <div className="bg-white border border-stone-100 rounded-2xl px-5 py-4 shadow-sm">
@@ -547,11 +608,62 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
             <span className="text-stone-600">{new Date(session.stopped_at).toLocaleString('zh-CN', { timeZone: 'Europe/London' })}</span>
           </div>
         )}
+        {member && (
+          <div className="flex justify-between text-stone-500">
+            <span>会员</span>
+            <span className="font-medium text-amber-700">{member.display_name ?? '（未填姓名）'} · {member.email}</span>
+          </div>
+        )}
         <div className="flex justify-between pt-1.5 border-t border-stone-200">
           <span className="font-semibold text-stone-600">系统原价</span>
           <span className="font-bold text-stone-800 text-base">{money(originalGbp)}</span>
         </div>
       </div>
+
+      {member && (
+        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-xl px-3 py-2 mb-4">
+          请核对柜台前的人与会员姓名一致。邮箱没有验证过，这一步是唯一的防线。
+        </p>
+      )}
+
+      {/* 会员优惠 */}
+      {member && (
+        <div className="mb-4">
+          <label className="block text-xs text-stone-400 mb-1">会员优惠</label>
+          {vipActive ? (
+            <div className="rounded-xl border border-terracotta/30 bg-terracotta/5 px-3 py-2 text-sm text-stone-700">
+              VIP Month 生效中{member.vip_expires_on ? `（至 ${member.vip_expires_on}）` : ''}，系统自动使用 85 折，
+              其他会员奖励暂时不可用。
+            </div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              <button
+                onClick={() => { setRewardType(null); setError('') }}
+                className={rewardType === null
+                  ? 'px-3 py-1.5 rounded-xl bg-terracotta text-white text-sm font-medium'
+                  : 'px-3 py-1.5 rounded-xl border border-stone-200 bg-white text-stone-600 text-sm hover:border-terracotta/40'}
+              >
+                不使用会员奖励
+              </button>
+              {member.usable_reward_types.map(rt => (
+                <button
+                  key={rt}
+                  onClick={() => { setRewardType(rt); setCode(''); setPreview(null); setError('') }}
+                  className={rewardType === rt
+                    ? 'px-3 py-1.5 rounded-xl bg-terracotta text-white text-sm font-medium'
+                    : 'px-3 py-1.5 rounded-xl border border-stone-200 bg-white text-stone-600 text-sm hover:border-terracotta/40'}
+                >
+                  {memberRewardLabels[rt]}
+                </button>
+              ))}
+            </div>
+          )}
+          {!vipActive && member.usable_reward_types.length === 0 && (
+            <p className="mt-1 text-xs text-stone-400">该会员当前没有可用的奖励。</p>
+          )}
+          <p className="mt-1 text-xs text-stone-400">同类多张时系统自动核销最早解锁的一张；刚解锁的奖励要下一次消费才能用。</p>
+        </div>
+      )}
 
       {/* 优惠码 */}
       <div className="mb-4">
@@ -560,13 +672,14 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
           <input
             className={inputCls + ' font-mono'}
             placeholder="TDXXXXXXXX"
+            disabled={vipActive || rewardType !== null}
             value={code}
             onChange={e => { setCode(e.target.value.toUpperCase()); setPreview(null); setError('') }}
             onKeyDown={e => e.key === 'Enter' && handleVerify()}
           />
           <button
             onClick={handleVerify}
-            disabled={verifying || !code.trim()}
+            disabled={verifying || !code.trim() || vipActive || rewardType !== null}
             className="px-4 py-2 rounded-xl bg-stone-800 text-white text-sm font-medium hover:bg-stone-700 disabled:opacity-50 transition shrink-0"
           >
             {verifying ? '验证中…' : '验证'}
@@ -576,6 +689,19 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
       </div>
 
       {/* 优惠预览 */}
+      {memberPreview && !preview && (
+        <div className="bg-terracotta/5 border border-terracotta/20 rounded-xl px-4 py-3 mb-4 text-sm space-y-1.5">
+          <div className="flex justify-between">
+            <span className="text-stone-500">会员优惠</span>
+            <span className="font-medium text-terracotta">{memberPreview.description}</span>
+          </div>
+          <div className="flex justify-between">
+            <span className="text-stone-500">优惠金额</span>
+            <span className="font-medium text-terracotta">−{money(memberPreview.discountGbp)}</span>
+          </div>
+        </div>
+      )}
+
       {preview && (
         <div className="bg-terracotta/5 border border-terracotta/20 rounded-xl px-4 py-3 mb-4 text-sm space-y-1.5">
           <div className="flex justify-between">

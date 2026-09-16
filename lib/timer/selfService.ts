@@ -1,6 +1,7 @@
 import { createAdminClient } from '@/lib/supabase/admin'
 import { generateTimerSessionId } from '@/lib/timer/sessionId'
 import { normalizeSeatCode, normalizeTableCode, normalizeSeatForLookup, SELF_SERVICE_TABLE_CODES } from '@/lib/timer/selfServiceCore'
+import { findMemberByEmail } from '@/lib/member/service'
 
 type AdminClient = ReturnType<typeof createAdminClient>
 
@@ -70,6 +71,8 @@ export interface StartSelfTimerInput {
   customerName?: string
   confirmNoMixedBeans: boolean
   idempotencyKey?: string
+  /** 顾客选了「以会员身份开始」时带上的邮箱。查不到或已停用都按普通顾客处理，不阻断计时（PRD 3.1） */
+  memberEmail?: string
 }
 
 export async function startSelfTimer(admin: AdminClient, input: StartSelfTimerInput) {
@@ -91,19 +94,36 @@ export async function startSelfTimer(admin: AdminClient, input: StartSelfTimerIn
     if (existingByKey?.session_id) return { sessionId: existingByKey.session_id as string, restored: true }
   }
 
+  // 会员归属在创建计时单时写入（PRD 5.1）。查询失败也不阻断，最多是这一次没算上
+  let memberId: string | null = null
+  if (input.memberEmail?.trim()) {
+    try {
+      const member = await findMemberByEmail(admin, input.memberEmail)
+      if (member?.is_active) memberId = member.member_id
+    } catch (lookupErr) {
+      console.error('[startSelfTimer] 会员查询失败，按普通计时继续:', lookupErr instanceof Error ? lookupErr.message : lookupErr)
+    }
+  }
+
   const sessionId = await generateTimerSessionId(admin)
+
+  // member_id 只在真的解析出会员时才写进 insert：会员表迁移还没上的环境里，
+  // 这一列不存在，写 null 也会让普通计时整条失败，那就得不偿失了。
+  const payload: Record<string, unknown> = {
+    session_id: sessionId,
+    booking_id: null,
+    customer_name: customerName,
+    table_number: seatNumber,
+    status: 'running',
+    started_at: new Date().toISOString(),
+    created_via: 'self_service',
+    idempotency_key: input.idempotencyKey ?? null,
+  }
+  if (memberId) payload.member_id = memberId
+
   const { data, error } = await admin
     .from('timer_sessions')
-    .insert({
-      session_id: sessionId,
-      booking_id: null,
-      customer_name: customerName,
-      table_number: seatNumber,
-      status: 'running',
-      started_at: new Date().toISOString(),
-      created_via: 'self_service',
-      idempotency_key: input.idempotencyKey ?? null,
-    })
+    .insert(payload)
     .select('session_id')
     .single()
 

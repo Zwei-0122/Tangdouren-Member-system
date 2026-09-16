@@ -7,6 +7,8 @@ import { calcBillingMinutes, calcBill } from '@/lib/timer/pricing'
 import { resolveActiveSeatCodeFromValue } from '@/lib/timer/selfService'
 import { computeSettlement } from '@/lib/coupon/coupon'
 import { loadSettlementContext, mapRpcError } from '@/lib/coupon/service'
+import { computeMemberDiscount, londonDateOf, type DiscountSource, type RewardType } from '@/lib/member/member'
+import { getMemberSettleInfo, mapMemberError } from '@/lib/member/service'
 
 type Action = 'start' | 'pause' | 'resume' | 'stop' | 'settle' | 'unsettle' | 'update_table'
 
@@ -28,7 +30,24 @@ export async function GET(
     .single()
 
   if (error || !data) return NextResponse.json({ error: '计时订单不存在' }, { status: 404 })
-  return NextResponse.json({ session: data })
+
+  // 结算台要显示这个订单的会员是谁：邮箱没有验证过，店员核对柜台前的人是目前唯一的防线
+  let member = null
+  if (data.member_id) {
+    const info = await getMemberSettleInfo(admin, data.member_id as string, londonDateOf(new Date()))
+    if (info) {
+      member = {
+        member_id:           info.member.member_id,
+        display_name:        info.member.display_name,
+        email:               info.member.email,
+        vip_active:          info.vipActive,
+        vip_expires_on:      info.vipExpiresOn,
+        usable_reward_types: info.usableTypes,
+      }
+    }
+  }
+
+  return NextResponse.json({ session: data, member })
 }
 
 export async function DELETE(
@@ -69,7 +88,15 @@ export async function PATCH(
 
   const { id }   = await params
   // 注意：结算金额一律由服务端计算，客户端传入的 actual_amount_gbp / 折扣字段会被忽略
-  const body     = await request.json() as { action: Action; coupon_code?: string; settlement_note?: string; table_number?: string }
+  const body     = await request.json() as {
+    action:           Action
+    coupon_code?:     string
+    settlement_note?: string
+    table_number?:    string
+    discount_source?: DiscountSource
+    member_id?:       string   // 朋友用券时，折扣出自另一位会员（PRD 10.3）
+    reward_type?:     RewardType
+  }
   const { action } = body
 
   if (!['start', 'pause', 'resume', 'stop', 'settle', 'unsettle', 'update_table'].includes(action)) {
@@ -112,21 +139,63 @@ export async function PATCH(
   const now    = new Date()
   let update: Record<string, unknown> = {}
 
-  // ── 结算（服务端计算金额 + 同一事务内核销优惠券）─────────────────────────────
+  // ── 结算（服务端计算金额 + 同一事务内核销优惠券或会员奖励）────────────────────
   if (action === 'settle') {
     const ctx = await loadSettlementContext(admin, id, body.coupon_code)
     if (!ctx.ok) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
 
-    const computed = computeSettlement(ctx.context.session, ctx.context.coupon)
-    if (!computed.ok) return NextResponse.json({ error: computed.error }, { status: 400 })
+    const sessionMemberId = (session.member_id as string | null) ?? null
+    // 朋友用券时折扣出自另一位会员，所以「奖励的拥有者」可能不等于本单的归属人
+    const sponsorMemberId = body.member_id ?? sessionMemberId
+    const memberInfo = sponsorMemberId
+      ? await getMemberSettleInfo(admin, sponsorMemberId, londonDateOf(new Date()))
+      : null
 
-    const { data: settled, error: rpcErr } = await admin.rpc('settle_timer_session', {
+    // 没显式指定来源时：本单会员有生效中的 VIP 就强制走 VIP（PRD 11.4），
+    // 否则按有没有券码决定用券还是不用优惠。
+    const source: DiscountSource = body.discount_source
+      ?? (memberInfo?.vipActive && sponsorMemberId === sessionMemberId ? 'vip_month'
+        : body.coupon_code ? 'coupon'
+        : 'none')
+
+    let discountPence: number
+    let preview: unknown
+    let couponCode: string | null = null
+
+    if (source === 'coupon') {
+      const computed = computeSettlement(ctx.context.session, ctx.context.coupon)
+      if (!computed.ok) return NextResponse.json({ error: computed.error }, { status: 400 })
+      discountPence = computed.preview.discountAmountPence
+      couponCode    = computed.preview.couponCode
+      preview       = computed.preview
+    } else {
+      const computed = computeMemberDiscount(source, {
+        amountGbp:  ctx.context.session.amount_gbp,
+        vipActive:  Boolean(memberInfo?.vipActive),
+        rewardType: body.reward_type ?? null,
+      })
+      if (!computed.ok) return NextResponse.json({ error: mapMemberError(computed.error) }, { status: 400 })
+      discountPence = computed.preview.discountAmountPence
+      preview       = computed.preview
+    }
+
+    // 金额一律服务端算好传进去，数据库再拿自己的记录复核一遍，对不上就报错。
+    // 会员参数只在真的用到会员折扣时传：迁移还没上的环境里旧版函数只有五个参数，
+    // 多传参数会让店员连普通结算都做不了。
+    const rpcParams: Record<string, unknown> = {
       p_session_id:            id,
       p_settled_by:            user.email ?? user.id,
       p_settlement_note:       body.settlement_note ?? null,
-      p_coupon_code:           computed.preview.couponCode,
-      p_discount_amount_pence: computed.preview.discountAmountPence,
-    })
+      p_coupon_code:           couponCode,
+      p_discount_amount_pence: discountPence,
+    }
+    if (source === 'member_reward' || source === 'vip_month') {
+      rpcParams.p_discount_source = source
+      rpcParams.p_member_id       = source === 'member_reward' ? sponsorMemberId : sessionMemberId
+      rpcParams.p_reward_type     = source === 'member_reward' ? (body.reward_type ?? null) : null
+    }
+
+    const { data: settled, error: rpcErr } = await admin.rpc('settle_timer_session', rpcParams)
 
     if (rpcErr) {
       console.error('[settle /api/admin/timers]', rpcErr.message)
@@ -143,7 +212,7 @@ export async function PATCH(
         .in('status', ['confirmed', 'payment_pending'])
     }
 
-    return NextResponse.json({ session: settled, preview: computed.preview })
+    return NextResponse.json({ session: settled, preview, discount_source: source })
   }
 
   // ── 撤销结算（同一事务内恢复优惠券）─────────────────────────────────────────
