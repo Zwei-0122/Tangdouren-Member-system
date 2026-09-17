@@ -27,7 +27,7 @@ const BookingSchema = z.object({
   email:           z.string().email('请输入有效的邮箱地址').max(100),
   remark:          z.string().max(500).optional(),
   lang:            z.enum(['zh', 'en']).optional().default('zh'),
-  // 勾选「加入 Tangdouren Club」：随预约一起建会员，不等支付结果（PRD 2.3）
+  // 勾选「加入糖豆人会员」：随预约一起建会员，不等支付结果（PRD 2.3）
   joinClub:        z.boolean().optional().default(false),
 })
 
@@ -46,9 +46,10 @@ export async function POST(request: NextRequest) {
     const { joinClub, ...bookingInput } = parsed.data
     const result   = await createBooking(bookingInput, supabase)
 
-    // 勾选了加入会员就在这里建，失败也不连累预约本身
+    // 勾选了加入会员就在这里建，失败也不连累预约本身。
+    // 英文版暂不开放会员制度（业主 2026-09-17）：英文提交即使带上 joinClub 也不建会员。
     let memberJoined = false
-    if (joinClub) {
+    if (joinClub && parsed.data.lang === 'zh') {
       try {
         const { member } = await ensureMember(supabase, {
           email:         parsed.data.email,
@@ -91,6 +92,7 @@ export async function POST(request: NextRequest) {
         studioAddress: 'Unit 226, 65-75 Whitechapel Road, London E1 1DU',
         studioEmail:   process.env.NEXT_PUBLIC_STUDIO_EMAIL ?? 'hello@tangdouren.co.uk',
         lang:          parsed.data.lang,
+        memberJoined,
       })
       const emailResult = await sendEmail({ to: parsed.data.email, subject, html })
       if (!emailResult.ok) {

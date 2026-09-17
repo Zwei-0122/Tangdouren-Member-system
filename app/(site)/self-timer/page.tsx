@@ -48,8 +48,8 @@ const copy = {
     lookupNamePlaceholder: '开始计时时填写的名字',
     lookupSubmit: '查询',
     lookupNotFound: '未找到进行中的计时，请检查座位号与名字是否正确。',
-    club: 'Tangdouren Club',
-    clubIntro: '每次到店计时都会累积进度，满 2 次就有 £2 抵用券，满 10 次解锁 VIP Month。',
+    club: '糖豆人会员',
+    clubIntro: '每次到店计时都会累积进度，满 2 次就有 £2 抵用券，满 10 次解锁 VIP 月卡。',
     clubWelcome: (name: string) => `欢迎回来，${name}`,
     clubContinue: (name: string) => `继续以 ${name} 的身份`,
     clubSwitch: '换一个账户',
@@ -59,7 +59,7 @@ const copy = {
     clubSigninTitle: '会员登录',
     clubSigninHint: '输入注册时用的邮箱即可识别，不需要会员号。',
     clubJoinTitle: '加入会员',
-    clubConsent: '我同意 Tangdouren Club 会员条款',
+    clubConsent: '我同意糖豆人会员条款',
     clubSubmitJoin: '加入会员',
     clubSubmitSignin: '继续',
     clubSubmitting: '处理中…',
@@ -101,19 +101,19 @@ const copy = {
     lookupNamePlaceholder: 'The name you entered',
     lookupSubmit: 'Find',
     lookupNotFound: 'No active timer found. Please check the seat number and name.',
-    club: 'Tangdouren Club',
+    club: 'Tangdouren Membership',
     clubIntro: 'Every in-store visit builds your progress. Two visits unlock a £2 voucher, ten unlock a VIP Month.',
     clubWelcome: (name: string) => `Welcome back, ${name}`,
     clubContinue: (name: string) => `Continue as ${name}`,
     clubSwitch: 'Use another account',
     clubForget: 'Forget this account',
     clubSignin: "I'm a Member",
-    clubJoin: 'Join the Club',
+    clubJoin: 'Join Tangdouren Membership',
     clubSigninTitle: 'Member sign in',
     clubSigninHint: 'Enter the email you registered with. There is no membership number.',
-    clubJoinTitle: 'Join the Club',
-    clubConsent: 'I agree to the Tangdouren Club membership terms',
-    clubSubmitJoin: 'Join Club',
+    clubJoinTitle: 'Join Tangdouren Membership',
+    clubConsent: 'I agree to the Tangdouren Membership terms',
+    clubSubmitJoin: 'Join Membership',
     clubSubmitSignin: 'Continue',
     clubSubmitting: 'Working…',
     clubEmailLabel: 'Email',
@@ -281,7 +281,10 @@ export default function SelfTimerPage() {
             <button className="btn-primary w-full" onClick={() => setPhase('form')}>{c.start}</button>
             <button className="btn-secondary w-full" onClick={() => setPhase('tutorial')}>{c.tutorial}</button>
             <button className="btn-secondary w-full" onClick={() => { setError(''); setPhase('lookup') }}>{c.lookupTitle}</button>
-            <button className="btn-secondary w-full" onClick={() => { setError(''); setClubEmail(''); setPhase('club') }}>{c.club}</button>
+            {/* 英文版暂不开放会员制度（业主 2026-09-17）：中文界面才显示会员入口 */}
+            {lang === 'zh' && (
+              <button className="btn-secondary w-full" onClick={() => { setError(''); setClubEmail(''); setPhase('club') }}>{c.club}</button>
+            )}
             <p className="text-center text-xs text-stone-400">{c.contactStaff}</p>
           </div>
         )}
@@ -345,8 +348,12 @@ export default function SelfTimerPage() {
 
         {phase === 'form' && (
           <div className="card p-5 space-y-4">
-            <p className="rounded-2xl bg-stone-50 px-4 py-3 text-xs leading-5 text-stone-500">{c.guestOnly}</p>
-            {member
+            {/* 这句是给中文会员制度做说明的，英文版不开放会员，就不出现 */}
+            {lang === 'zh' && (
+              <p className="rounded-2xl bg-stone-50 px-4 py-3 text-xs leading-5 text-stone-500">{c.guestOnly}</p>
+            )}
+            {/* 英文版不出现会员身份：既不显示「以会员身份开始」，也不带出设备上记住的会员 */}
+            {lang === 'zh' && (member
               ? <p className="rounded-2xl bg-terracotta/5 border border-terracotta/20 px-4 py-3 text-xs leading-5 text-charcoal">{c.memberStarting(member.display_name ?? member.email)}</p>
               : (
                 <button
@@ -356,7 +363,7 @@ export default function SelfTimerPage() {
                 >
                   {c.memberStartHint}
                 </button>
-              )}
+              ))}
             <div>
               <span className="label">{c.tableLabel}</span>
               <div className="mt-2 flex flex-wrap gap-2">

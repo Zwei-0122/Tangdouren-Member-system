@@ -67,7 +67,7 @@ const memberRewardLabels: Record<RewardType, string> = {
   FIVE_POUND:      '£5 抵用券',
   PERSONAL_15_OFF: '本人 85 折',
   FRIEND_10_OFF:   '朋友 9 折',
-  VIP_MONTH:       'VIP Month',
+  VIP_MONTH:       'VIP 月卡',
 }
 
 function calcElapsed(session: TimerSession): number {
@@ -397,14 +397,17 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
   const [saving,     setSaving]     = useState(false)
   const [error,      setError]      = useState('')
   const [rewardType, setRewardType] = useState<RewardType | null>(null)
+  const [overrideVip, setOverrideVip] = useState(false)
 
-  // VIP 生效期间系统强制走 VIP 85 折，店员不能改用其他会员奖励（PRD 11.4）
-  const vipActive = Boolean(member?.vip_active)
+  // VIP 生效期间默认走 VIP 85 折；店员可以打开「改用其他优惠」手动改用券或奖励，
+  // 当次放弃 VIP 折扣，VIP 的 30 天不顺延（业主 2026-09-16 口径）
+  const vipActive  = Boolean(member?.vip_active)
+  const vipDefault = vipActive && !overrideVip
 
   /** 会员折扣的预览。金额规则与数据库复核用的是同一套（lib/member/member.ts） */
   const memberPreview = (() => {
     if (!member) return null
-    const effective: DiscountSource = vipActive ? 'vip_month' : rewardType ? 'member_reward' : 'none'
+    const effective: DiscountSource = vipDefault ? 'vip_month' : rewardType ? 'member_reward' : 'none'
     if (effective === 'none') return null
     const computed = computeMemberDiscount(effective, {
       amountGbp:  session.amount_gbp,
@@ -461,7 +464,7 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
           {session.reward_eligible === false && (
             <div className="flex justify-between">
               <span className="text-stone-500">本次进度</span>
-              <span className="font-medium text-amber-700">VIP 期间，不计入 Reward Progress</span>
+              <span className="font-medium text-amber-700">后台补挂，不计入奖励进度</span>
             </div>
           )}
           <div className="flex justify-between pt-1.5 border-t border-emerald-200">
@@ -522,12 +525,17 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
 
   async function handleSettle() {
     // 一次结算只能有一个折扣来源（PRD 21）
-    const effectiveSource: DiscountSource = vipActive
+    const effectiveSource: DiscountSource = vipDefault
       ? 'vip_month'
       : rewardType
         ? 'member_reward'
         : code.trim() ? 'coupon' : 'none'
 
+    // 打开了「改用其他优惠」却什么都没选，等于让 VIP 会员按原价结账，这里先拦一道
+    if (vipActive && overrideVip && effectiveSource === 'none') {
+      setError('已打开「改用其他优惠」但还没选券或奖励。选一项，或点「恢复 VIP 85 折」')
+      return
+    }
     if (effectiveSource === 'coupon' && !preview) { setError('请先点击「验证」确认优惠码'); return }
     if (effectiveSource === 'member_reward' && !memberPreview) { setError('该会员奖励当前不可用'); return }
     setError('')
@@ -630,12 +638,25 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
       {member && (
         <div className="mb-4">
           <label className="block text-xs text-stone-400 mb-1">会员优惠</label>
-          {vipActive ? (
+          {vipActive && (
             <div className="rounded-xl border border-terracotta/30 bg-terracotta/5 px-3 py-2 text-sm text-stone-700">
-              VIP Month 生效中{member.vip_expires_on ? `（至 ${member.vip_expires_on}）` : ''}，系统自动使用 85 折，
-              其他会员奖励暂时不可用。
+              <p>
+                VIP 月卡生效中{member.vip_expires_on ? `（至 ${member.vip_expires_on}）` : ''}，本单默认按 85 折结算。
+              </p>
+              <button
+                onClick={() => { setOverrideVip(v => !v); setRewardType(null); setCode(''); setPreview(null); setError('') }}
+                className="mt-2 px-3 py-1 rounded-xl border border-terracotta/40 bg-white text-xs font-medium text-terracotta hover:bg-terracotta/5"
+              >
+                {overrideVip ? '恢复 VIP 85 折' : '改用其他优惠'}
+              </button>
+              {overrideVip && (
+                <p className="mt-2 text-xs text-amber-700">
+                  本单不使用 VIP 折扣：下面选中的券或奖励会替代它，VIP 剩余天数不顺延。
+                </p>
+              )}
             </div>
-          ) : (
+          )}
+          {(!vipActive || overrideVip) && (
             <div className="flex flex-wrap gap-2">
               <button
                 onClick={() => { setRewardType(null); setError('') }}
@@ -658,7 +679,7 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
               ))}
             </div>
           )}
-          {!vipActive && member.usable_reward_types.length === 0 && (
+          {(!vipActive || overrideVip) && member.usable_reward_types.length === 0 && (
             <p className="mt-1 text-xs text-stone-400">该会员当前没有可用的奖励。</p>
           )}
           <p className="mt-1 text-xs text-stone-400">同类多张时系统自动核销最早解锁的一张；刚解锁的奖励要下一次消费才能用。</p>
@@ -672,14 +693,14 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
           <input
             className={inputCls + ' font-mono'}
             placeholder="TDXXXXXXXX"
-            disabled={vipActive || rewardType !== null}
+            disabled={vipDefault || rewardType !== null}
             value={code}
             onChange={e => { setCode(e.target.value.toUpperCase()); setPreview(null); setError('') }}
             onKeyDown={e => e.key === 'Enter' && handleVerify()}
           />
           <button
             onClick={handleVerify}
-            disabled={verifying || !code.trim() || vipActive || rewardType !== null}
+            disabled={verifying || !code.trim() || vipDefault || rewardType !== null}
             className="px-4 py-2 rounded-xl bg-stone-800 text-white text-sm font-medium hover:bg-stone-700 disabled:opacity-50 transition shrink-0"
           >
             {verifying ? '验证中…' : '验证'}

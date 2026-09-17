@@ -199,7 +199,8 @@ BEGIN
   END;
 
   ------------------------------------------------------------------
-  -- 4. VIP 期间结算：自动 85 折、进度暂停、不能改用别的优惠
+  -- 4. VIP 期间结算：默认 85 折、进度照常累积、可手动改用其他优惠
+  --    （业主 2026-09-16 口径）
   ------------------------------------------------------------------
   INSERT INTO timer_sessions (
     session_id, customer_name, status, started_at, is_settled,
@@ -212,13 +213,13 @@ BEGIN
 
   SELECT actual_amount_gbp INTO v_num FROM timer_sessions WHERE session_id = v_s;
   INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
-    ('VIP 期间结算自动 85 折（13.99 → 11.89）', '11.89', v_num::text,
+    ('VIP 期间结算默认 85 折（13.99 → 11.89）', '11.89', v_num::text,
      CASE WHEN v_num = 11.89 THEN 'PASS' ELSE 'FAIL' END);
 
   SELECT reward_eligible INTO v_bool FROM timer_sessions WHERE session_id = v_s;
   INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
-    ('VIP 期间的单不计入 Reward Progress', 'false', v_bool::text,
-     CASE WHEN v_bool IS FALSE THEN 'PASS' ELSE 'FAIL' END);
+    ('VIP 期间的单照常计入 Reward Progress', 'true', v_bool::text,
+     CASE WHEN v_bool IS TRUE THEN 'PASS' ELSE 'FAIL' END);
 
   SELECT count(*) INTO v_cnt FROM member_visit_days WHERE member_id = v_a;
   INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
@@ -227,8 +228,8 @@ BEGIN
 
   SELECT count(*) INTO v_cnt FROM member_visit_days WHERE member_id = v_a AND reward_eligible;
   INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
-    ('VIP 期间 Reward Progress 停住（仍为 12）', '12', v_cnt::text,
-     CASE WHEN v_cnt = 12 THEN 'PASS' ELSE 'FAIL' END);
+    ('VIP 期间 Reward Progress 照常加（12 → 13）', '13', v_cnt::text,
+     CASE WHEN v_cnt = 13 THEN 'PASS' ELSE 'FAIL' END);
 
   INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled,
     billing_minutes, amount_gbp, created_via, created_by, member_id)
@@ -236,28 +237,47 @@ BEGIN
           60, 13.99, 'self_service', 'hermes_test', v_a)
   RETURNING session_id INTO v_s2;
 
+  -- 什么都不选：VIP 会员不该按原价结账，必须拦住
   BEGIN
-    PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, NULL, 200, 'member_reward', v_a, 'TWO_POUND');
+    PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, NULL, 0, 'none', NULL, NULL);
     INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
-      ('VIP 期间不能改用会员奖励', 'VIP_MUST_BE_APPLIED', '居然结算成功', 'FAIL');
+      ('VIP 期间「不使用优惠」被拦', 'VIP_MUST_BE_APPLIED', '居然结算成功', 'FAIL');
   EXCEPTION WHEN OTHERS THEN
     INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
-      ('VIP 期间不能改用会员奖励', 'VIP_MUST_BE_APPLIED', SQLERRM,
+      ('VIP 期间「不使用优惠」被拦', 'VIP_MUST_BE_APPLIED', SQLERRM,
        CASE WHEN SQLERRM LIKE '%VIP_MUST_BE_APPLIED%' THEN 'PASS' ELSE 'FAIL' END);
   END;
+
+  -- 手动改用会员奖励：应当成功，当次放弃 VIP 折扣
+  BEGIN
+    PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, NULL, 200, 'member_reward', v_a, 'TWO_POUND');
+    SELECT actual_amount_gbp INTO v_num FROM timer_sessions WHERE session_id = v_s2;
+    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+      ('VIP 期间可以改用会员奖励（13.99 → 11.99）', '11.99', v_num::text,
+       CASE WHEN v_num = 11.99 THEN 'PASS' ELSE 'FAIL' END);
+  EXCEPTION WHEN OTHERS THEN
+    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+      ('VIP 期间可以改用会员奖励（13.99 → 11.99）', '11.99', SQLERRM, 'FAIL');
+  END;
+
+  PERFORM unsettle_timer_session(v_s2);   -- 撤销回来，供下一条复用
 
   INSERT INTO coupons (code, discount_type, discount_value, created_by)
   VALUES ('HTTEST0001', 'percentage_off', 10, 'hermes_test') RETURNING coupon_id INTO v_coupon;
 
+  -- 手动改用普通优惠券：同样应当成功
   BEGIN
     PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, 'HTTEST0001', 140, 'coupon', NULL, NULL);
+    SELECT actual_amount_gbp INTO v_num FROM timer_sessions WHERE session_id = v_s2;
     INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
-      ('VIP 期间普通优惠券也走强制 VIP（我们补的解释）', 'VIP_MUST_BE_APPLIED', '居然结算成功', 'FAIL');
+      ('VIP 期间也可以改用普通优惠券（13.99 → 12.59）', '12.59', v_num::text,
+       CASE WHEN v_num = 12.59 THEN 'PASS' ELSE 'FAIL' END);
   EXCEPTION WHEN OTHERS THEN
     INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
-      ('VIP 期间普通优惠券也走强制 VIP（我们补的解释）', 'VIP_MUST_BE_APPLIED', SQLERRM,
-       CASE WHEN SQLERRM LIKE '%VIP_MUST_BE_APPLIED%' THEN 'PASS' ELSE 'FAIL' END);
+      ('VIP 期间也可以改用普通优惠券（13.99 → 12.59）', '12.59', SQLERRM, 'FAIL');
   END;
+
+  PERFORM unsettle_timer_session(v_s2);   -- 再撤销回来
 
   -- 让这张 VIP 过期，回到非 VIP 状态继续测别的
   UPDATE member_benefits

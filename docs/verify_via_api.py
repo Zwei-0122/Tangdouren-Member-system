@@ -3,9 +3,9 @@
 # 会员系统真实数据验证（走 PostgREST + service key，不需要额外 token）
 #
 # 覆盖：视图计数与同日去重、解锁档位与幂等、VIP 激活与日期边界、
-#       VIP 期间进度暂停与强制折扣、£2 券核销与撤销回退、
+#       VIP 期间进度照常累积与「默认 VIP、可手动改用其他优惠」、£2 券核销与撤销回退、
 #       朋友券用在他人的订单上、本人券不能给他人、刚解锁的奖励不能当次用、
-#       撤销结算的守卫条件。
+#       撤销结算的守卫条件、后台补挂已结算订单的规矩。
 #
 # 会先清掉上次的测试数据（幂等可重跑），跑完保留数据供在界面上查看。
 # ============================================================
@@ -211,7 +211,7 @@ st, out = rpc("activate_member_vip", p_reward_id=orphan[0]["reward_id"], p_activ
 check("奖励在但权益行缺失 → 报权益不存在", "MEMBER_BENEFIT_NOT_FOUND", err_of((st, out)))
 wipe("member_rewards", f"reward_id=eq.{orphan[0]['reward_id']}", "清掉刚造的孤儿奖励")
 
-# ── 5. VIP 期间结算：自动 85 折 + 进度暂停 ──────────────────────────────────
+# ── 5. VIP 期间结算：默认 85 折 + 进度照常累积 ──────────────────────────────
 add_session("DEMO-VIP-1", A, 13.99, 0, settled=False)
 st, out = rpc("settle_timer_session", p_session_id="DEMO-VIP-1", p_settled_by="hermes_test",
               p_discount_amount_pence=210, p_discount_source="vip_month", p_member_id=A)
@@ -219,24 +219,36 @@ check("VIP 期间结算成功", 200, st)
 st, rows = sel("timer_sessions", "select=actual_amount_gbp,reward_eligible,discount_amount_gbp&session_id=eq.DEMO-VIP-1")
 check("VIP 自动 85 折（13.99 → 11.89）", "11.89", rows[0]["actual_amount_gbp"])
 check("折扣金额记为 £2.10", 2.10, round(float(rows[0]["discount_amount_gbp"]), 2))
-check("VIP 期间的单不计入 Reward Progress", False, rows[0]["reward_eligible"])
+check("VIP 期间的单照常计入 Reward Progress（业主 2026-09-16 口径）", True, rows[0]["reward_eligible"])
 st, rows = sel("member_visit_days", "select=reward_eligible&member_id=eq." + A)
 check("VIP 期间 Lifetime 照常加（→13）", 13, len(rows))
-check("VIP 期间 Reward Progress 停住（仍 12）", 12, sum(1 for r in rows if r["reward_eligible"]))
+check("VIP 期间 Reward Progress 照常加（→13）", 13, sum(1 for r in rows if r["reward_eligible"]))
 
-# ── 6. VIP 期间不能改用别的优惠 ─────────────────────────────────────────────
+# ── 6. VIP 期间：不选优惠被拦，改用券或奖励放行（业主 2026-09-16 口径）──────
 add_session("DEMO-VIP-2", A, 13.99, 0, settled=False)
+st, out = rpc("settle_timer_session", p_session_id="DEMO-VIP-2", p_settled_by="hermes_test",
+              p_discount_amount_pence=0, p_discount_source="none")
+check("VIP 期间「不使用优惠」被拦（会员不该按原价结账）", "VIP_MUST_BE_APPLIED", err_of((st, out)))
+
 st, out = rpc("settle_timer_session", p_session_id="DEMO-VIP-2", p_settled_by="hermes_test",
               p_discount_amount_pence=200, p_discount_source="member_reward",
               p_member_id=A, p_reward_type="TWO_POUND")
-check("VIP 期间不能改用会员奖励", "VIP_MUST_BE_APPLIED", err_of((st, out)))
+check("VIP 期间可以改用会员奖励（当次放弃 VIP 折扣）", 200, st)
+st, rows = sel("timer_sessions", "select=actual_amount_gbp&session_id=eq.DEMO-VIP-2")
+check("改用 £2 券后金额 13.99 → 11.99", "11.99", rows[0]["actual_amount_gbp"])
+st, out = rpc("unsettle_timer_session", p_session_id="DEMO-VIP-2")
+check("把这一单撤销回来，供下一步复用", 200, st)
 
 st, cpn = req("POST", "/rest/v1/coupons", [{"code": "TDTEST0001", "code_prefix": "TD",
               "discount_type": "percentage_off", "discount_value": 10, "created_by": "hermes_test"}],
               prefer="return=representation")
 st, out = rpc("settle_timer_session", p_session_id="DEMO-VIP-2", p_settled_by="hermes_test",
               p_coupon_code="TDTEST0001", p_discount_amount_pence=140, p_discount_source="coupon")
-check("VIP 期间普通优惠券也被强制 VIP（我们补的解释）", "VIP_MUST_BE_APPLIED", err_of((st, out)))
+check("VIP 期间也可以改用普通优惠券", 200, st)
+st, rows = sel("timer_sessions", "select=actual_amount_gbp&session_id=eq.DEMO-VIP-2")
+check("改用 10% 券后金额 13.99 → 12.59", "12.59", rows[0]["actual_amount_gbp"])
+st, out = rpc("unsettle_timer_session", p_session_id="DEMO-VIP-2")
+check("再撤销回来，回到未结算", 200, st)
 
 # ── 7. 让 VIP 过期，回到非 VIP ─────────────────────────────────────────────
 st, ben3 = sel("member_benefits", f"select=benefit_id&member_id=eq.{A}")
@@ -312,16 +324,30 @@ check("第二笔用掉那张刚解锁的 £2", 200, st)
 st, out = rpc("unsettle_timer_session", p_session_id="DEMO-B-002")
 check("奖励已被后续使用则拒绝撤销来源结算", "REWARD_ALREADY_USED", err_of((st, out)))
 
-# ── 11b. Link to Member：未结算可挂，已结算拒绝 ─────────────────────────────
+# ── 11b. Link to Member：未结算可挂；已结算的补挂只记到店次数 ───────────────
 add_session("DEMO-LINK-1", None, 13.99, 5, settled=False)
 st, out = rpc("link_timer_session_to_member", p_session_id="DEMO-LINK-1", p_member_id=B)
 check("未结算的订单可以挂到会员", 200, st)
-st, rows = sel("timer_sessions", "select=member_id&session_id=eq.DEMO-LINK-1")
+st, rows = sel("timer_sessions", "select=member_id,reward_eligible&session_id=eq.DEMO-LINK-1")
 check("挂上去之后归属正确", B, rows[0]["member_id"])
+check("未结算的单挂上后进度资格仍是 NULL（等结算时判定）", None, rows[0]["reward_eligible"])
 
+st, vbefore = sel("member_visit_days", f"select=reward_eligible&member_id=eq.{B}")
 add_session("DEMO-LINK-2", None, 13.99, 6)
 st, out = rpc("link_timer_session_to_member", p_session_id="DEMO-LINK-2", p_member_id=B)
-check("已结算的订单拒绝挂会员（我们定的口径）", "SESSION_ALREADY_SETTLED", err_of((st, out)))
+check("已结算的散客单允许补挂（业主 2026-09-16 口径）", 200, st)
+st, rows = sel("timer_sessions", "select=member_id,reward_eligible,actual_amount_gbp&session_id=eq.DEMO-LINK-2")
+check("补挂后归属正确", B, rows[0]["member_id"])
+check("补挂只记到店：reward_eligible = false", False, rows[0]["reward_eligible"])
+check("补挂不动已收金额", "13.99", rows[0]["actual_amount_gbp"])
+st, vafter = sel("member_visit_days", f"select=reward_eligible&member_id=eq.{B}")
+check("补挂让 Lifetime 加 1", len(vbefore or []) + 1, len(vafter or []))
+check("补挂不让进度加",
+      sum(1 for x in (vbefore or []) if x["reward_eligible"]),
+      sum(1 for x in (vafter or []) if x["reward_eligible"]))
+
+st, out = rpc("link_timer_session_to_member", p_session_id="DEMO-LINK-2", p_member_id=A)
+check("已结算且已归属的单不能再改到别的会员", "SESSION_ALREADY_LINKED", err_of((st, out)))
 
 st, out = rpc("link_timer_session_to_member", p_session_id="DEMO-LINK-1", p_member_id="00000000-0000-0000-0000-000000000000")
 check("挂到不存在的会员会被拒", "MEMBER_NOT_FOUND", err_of((st, out)))

@@ -1,25 +1,25 @@
 'use client'
 
-// 会员首页（PRD 12、13、14）：同页展示进度、奖励、到店记录与奖励历史，不拆成二级入口。
+// 会员首页（PRD 12、13、14）：同页展示进度、奖励、到店记录，不拆成二级入口。
+// 2026-09-16：原「我的奖励」与「奖励记录」是同一份数据的两个视图（后者是前者的超集），合并成一块。
 
 import { useCallback, useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, CalendarCheck, Crown, Gift, History, Sparkles } from 'lucide-react'
+import { ArrowLeft, CalendarCheck, Crown, Gift, Sparkles } from 'lucide-react'
 import { useLanguage } from '@/lib/i18n/LanguageContext'
 import MemberProgressBar from '@/components/member/MemberProgressBar'
 import { forgetMember, readRememberedMember } from '@/lib/member/client'
 import type { MemberDashboard, MemberRewardEntry, MemberVisitEntry } from '@/lib/member/service'
-import type { RewardType } from '@/lib/member/member'
+import { londonDateOf, vipRewardState, type RewardType } from '@/lib/member/member'
 
 const copy = {
   zh: {
-    title:        'Tangdouren Club',
+    title:        '糖豆人会员页',
     hi:           (name: string) => `你好，${name}`,
     loading:      '正在读取会员信息…',
     startAsMember:'以会员身份开始计时',
     myRewards:    '我的奖励',
     recentVisits: '最近到店',
-    rewardHistory:'奖励记录',
     viewAll:      '查看全部',
     collapse:     '收起',
     noRewards:    '还没有解锁奖励，计满 2 次就能拿到第一张 £2 抵用券。',
@@ -27,42 +27,45 @@ const copy = {
     notMember:    '这台设备上没有记住会员身份。',
     backToTimer:  '回到首页',
     switchAccount:'切换账户',
-    vipActive:    (date: string) => `VIP Month 生效中，有效期至 ${date}`,
-    vipReady:     (n: number) => `你有 ${n} 张未激活的 VIP Month`,
-    vipHint:      '激活后 30 天内每次计时自动享受 85 折，期间其他奖励暂时不可用但不会过期。',
+    vipActive:    (date: string) => `VIP 月卡生效中，有效期至 ${date}`,
+    vipReady:     (n: number) => `你有 ${n} 张未激活的 VIP 月卡`,
+    vipHint:      '激活后 30 天内每次计时自动享受 85 折。',
     vipActivate:  '立即激活',
     vipActivating:'激活中…',
     vipActivated: '已激活',
-    vipNone:      '累计 10 次到店解锁 VIP Month',
+    vipNone:      '累计 10 次到店解锁 VIP 月卡',
     rewardNames: {
       TWO_POUND:       '£2 抵用券',
       FIVE_POUND:      '£5 抵用券',
       PERSONAL_15_OFF: '本人 85 折',
       FRIEND_10_OFF:   '朋友 9 折',
-      VIP_MONTH:       'VIP Month',
+      VIP_MONTH:       'VIP 月卡',
     } as Record<RewardType, string>,
     states: {
       available:      '可用',
       used:           '已使用',
-      paused_by_vip:  'VIP 结束后可用',
+      paused_by_vip:  'VIP 月卡生效中，暂不自行使用',
       transferred:    '已转赠给朋友',
     },
     progressCounted: '计入进度',
-    progressPaused:  'VIP 期间，进度暂停',
+    progressPaused:  '未计入进度',
     usedReward:      (name: string) => `使用了${name}`,
-    usedVip:         '使用 VIP 85 折',
+    usedVip:         '使用 VIP 月卡 85 折',
     noRewardUsed:    '未使用会员优惠',
     unlockedOn:      (d: string) => `${d} 解锁`,
     usedOn:          (d: string) => `${d} 使用`,
+    activatedOn:     (d: string) => `${d} 激活`,
+    vipStateReady:   '未激活',
+    vipStateActive:  (d: string) => `生效中 · 至 ${d}`,
+    vipStateEnded:   '已结束',
   },
   en: {
-    title:        'Tangdouren Club',
+    title:        'Tangdouren Membership',
     hi:           (name: string) => `Hi ${name}`,
     loading:      'Loading your membership…',
     startAsMember:'Start as Member',
     myRewards:    'My Rewards',
     recentVisits: 'Recent Visits',
-    rewardHistory:'Reward History',
     viewAll:      'View all',
     collapse:     'Show less',
     noRewards:    'No rewards yet — two visits unlock your first £2 voucher.',
@@ -72,7 +75,7 @@ const copy = {
     switchAccount:'Use another account',
     vipActive:    (date: string) => `VIP Month active until ${date}`,
     vipReady:     (n: number) => `You have ${n} VIP Month ready to activate`,
-    vipHint:      'Activate it and every timer session is 15% off for 30 days. Other rewards stay available after it ends.',
+    vipHint:      'Activate it and every timer session is 15% off for 30 days. Visit progress keeps counting as usual.',
     vipActivate:  'Activate now',
     vipActivating:'Activating…',
     vipActivated: 'Activated',
@@ -87,16 +90,20 @@ const copy = {
     states: {
       available:      'Available',
       used:           'Used',
-      paused_by_vip:  'Available after VIP Month',
+      paused_by_vip:  'Not self-usable during VIP Month',
       transferred:    'Given to a friend',
     },
     progressCounted: 'Counted',
-    progressPaused:  'Progress paused during VIP',
+    progressPaused:  'Not counted',
     usedReward:      (name: string) => `Used ${name}`,
     usedVip:         'Used VIP 15% off',
     noRewardUsed:    'No member discount',
     unlockedOn:      (d: string) => `Unlocked ${d}`,
     usedOn:          (d: string) => `Used ${d}`,
+    activatedOn:     (d: string) => `Activated ${d}`,
+    vipStateReady:   'Not activated',
+    vipStateActive:  (d: string) => `Active until ${d}`,
+    vipStateEnded:   'Ended',
   },
 } as const
 
@@ -106,7 +113,7 @@ function dateOf(iso: string | null): string {
 
 export default function ClubPage() {
   const router = useRouter()
-  const { lang } = useLanguage()
+  const { lang, toggle } = useLanguage()
   const c = copy[lang]
 
   const [dashboard, setDashboard] = useState<MemberDashboard | null>(null)
@@ -114,7 +121,7 @@ export default function ClubPage() {
   const [error, setError]         = useState('')
   const [activating, setActivating] = useState('')
   const [showAllVisits, setShowAllVisits] = useState(false)
-  const [showAllHistory, setShowAllHistory] = useState(false)
+  const [showAllRewards, setShowAllRewards] = useState(false)
 
   const load = useCallback(async () => {
     const remembered = readRememberedMember()
@@ -163,9 +170,49 @@ export default function ClubPage() {
   }
 
   const memberName  = dashboard?.member.display_name ?? ''
+  const londonToday = londonDateOf(new Date())
   const readyVip    = (dashboard?.rewards ?? []).filter(r => r.reward.reward_type === 'VIP_MONTH' && !r.benefit?.activated_on)
+
+  /**
+   * 奖励行右侧的状态。VIP 月卡这类奖励不能照搬券的状态（「生效中，暂不自行使用」是说给券听的），
+   * 它自己的状态由权益日期派生：未激活 / 生效中至 X / 已结束。
+   */
+  const rewardBadge = (entry: MemberRewardEntry): { text: string; tone: string } => {
+    if (entry.reward.reward_type === 'VIP_MONTH') {
+      const state = vipRewardState(entry.benefit, londonToday)
+      if (state === 'active') return { text: c.vipStateActive(entry.benefit?.expires_on ?? ''), tone: 'text-sage' }
+      if (state === 'ended')  return { text: c.vipStateEnded,  tone: 'text-charcoal-light' }
+      if (state === 'ready')  return { text: c.vipStateReady,  tone: 'text-sage' }
+    }
+    return {
+      text: c.states[entry.state],
+      tone: entry.state === 'available' ? 'text-sage' : 'text-charcoal-light',
+    }
+  }
   const visitRows   = dashboard?.visit_history ?? []
   const rewardRows  = dashboard?.rewards ?? []
+
+  // 英文版暂不开放会员制度（业主 2026-09-17）：英文界面只给一句提示与切回中文的按钮。
+  // 会员页本身是中文优先的页面，数据与接口都没变，中文界面照旧。
+  if (lang !== 'zh') {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-cream-100 via-orange-50 to-rose-50 px-4 pb-24 pt-24">
+        <div className="mx-auto max-w-md space-y-4">
+          <div className="card space-y-4 p-6 text-center">
+            <h1 className="font-display text-xl font-semibold text-charcoal">Tangdouren Membership</h1>
+            <p className="text-sm leading-6 text-charcoal-light">
+              The membership programme is currently available in Chinese only. Switch the site to
+              Chinese to join or view your rewards.
+            </p>
+            <button className="btn-primary w-full" onClick={toggle}>Switch to Chinese</button>
+            <button className="btn-ghost w-full text-sm" onClick={() => router.push('/self-timer')}>
+              Back to home
+            </button>
+          </div>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-cream-100 via-orange-50 to-rose-50 px-4 pb-24 pt-24">
@@ -201,6 +248,7 @@ export default function ClubPage() {
               nextReward={dashboard.next_reward}
               lifetimeVisits={dashboard.lifetime_visits}
               lang={lang}
+              expandable
             />
 
             <button className="btn-primary w-full py-3.5 text-base" onClick={() => router.push('/self-timer')}>
@@ -211,7 +259,7 @@ export default function ClubPage() {
             <div className="card space-y-3 p-5">
               <div className="flex items-center gap-2">
                 <Crown size={16} className="text-terracotta" />
-                <h2 className="font-display text-lg font-semibold text-charcoal">VIP Month</h2>
+                <h2 className="font-display text-lg font-semibold text-charcoal">{c.rewardNames.VIP_MONTH}</h2>
               </div>
               {dashboard.vip.active_expires_on
                 ? <p className="text-sm text-charcoal">{c.vipActive(dashboard.vip.active_expires_on)}</p>
@@ -232,7 +280,7 @@ export default function ClubPage() {
                   : <p className="text-sm text-charcoal-light">{c.vipNone}</p>}
             </div>
 
-            {/* ── My Rewards（PRD 13.1）────────────────────────────────── */}
+            {/* ── My Rewards（PRD 13.1；2026-09-16 把原 13.2「奖励记录」合并进来）── */}
             <div className="card space-y-3 p-5">
               <div className="flex items-center gap-2">
                 <Gift size={16} className="text-terracotta" />
@@ -240,15 +288,28 @@ export default function ClubPage() {
               </div>
               {rewardRows.length === 0 && <p className="text-sm text-charcoal-light">{c.noRewards}</p>}
               <ul className="space-y-2">
-                {rewardRows.map(entry => (
-                  <li key={entry.reward.reward_id} className="flex items-center justify-between gap-3 rounded-2xl border border-sand-100 bg-white px-3 py-2">
-                    <span className="text-sm text-charcoal">{c.rewardNames[entry.reward.reward_type]}</span>
-                    <span className={`text-xs ${entry.state === 'available' ? 'text-sage' : 'text-charcoal-light'}`}>
-                      {c.states[entry.state]}
-                    </span>
-                  </li>
-                ))}
+                {(showAllRewards ? rewardRows : rewardRows.slice(0, 5)).map((entry: MemberRewardEntry) => {
+                  const badge = rewardBadge(entry)
+                  return (
+                    <li key={entry.reward.reward_id} className="rounded-2xl border border-sand-100 bg-white px-3 py-2">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-sm text-charcoal">{c.rewardNames[entry.reward.reward_type]}</span>
+                        <span className={`text-xs ${badge.tone}`}>{badge.text}</span>
+                      </div>
+                      <p className="mt-0.5 text-xs text-charcoal-light">
+                        {c.unlockedOn(dateOf(entry.reward.unlocked_at))}
+                        {entry.reward.used_at && ` · ${c.usedOn(dateOf(entry.reward.used_at))}`}
+                        {entry.reward.reward_type === 'VIP_MONTH' && entry.benefit?.activated_on && ` · ${c.activatedOn(entry.benefit.activated_on)}`}
+                      </p>
+                    </li>
+                  )
+                })}
               </ul>
+              {rewardRows.length > 5 && (
+                <button className="btn-ghost w-full text-sm" onClick={() => setShowAllRewards(v => !v)}>
+                  {showAllRewards ? c.collapse : c.viewAll}
+                </button>
+              )}
             </div>
 
             {/* ── Recent Visits（PRD 14）──────────────────────────────── */}
@@ -284,33 +345,6 @@ export default function ClubPage() {
               )}
             </div>
 
-            {/* ── Reward History（PRD 13.2）────────────────────────────── */}
-            <div className="card space-y-3 p-5">
-              <div className="flex items-center gap-2">
-                <History size={16} className="text-terracotta" />
-                <h2 className="font-display text-lg font-semibold text-charcoal">{c.rewardHistory}</h2>
-              </div>
-              <ul className="space-y-2">
-                {(showAllHistory ? rewardRows : rewardRows.slice(0, 5)).map((entry: MemberRewardEntry) => (
-                  <li key={entry.reward.reward_id} className="rounded-2xl border border-sand-100 bg-white px-3 py-2">
-                    <div className="flex items-center justify-between">
-                      <span className="text-sm text-charcoal">{c.rewardNames[entry.reward.reward_type]}</span>
-                      <span className="text-xs text-charcoal-light">{c.states[entry.state]}</span>
-                    </div>
-                    <p className="mt-0.5 text-xs text-charcoal-light">
-                      {c.unlockedOn(dateOf(entry.reward.unlocked_at))}
-                      {entry.reward.used_at && ` · ${c.usedOn(dateOf(entry.reward.used_at))}`}
-                      {entry.benefit?.activated_on && ` · ${c.vipActive(entry.benefit.expires_on ?? '')}`}
-                    </p>
-                  </li>
-                ))}
-              </ul>
-              {rewardRows.length > 5 && (
-                <button className="btn-ghost w-full text-sm" onClick={() => setShowAllHistory(v => !v)}>
-                  {showAllHistory ? c.collapse : c.viewAll}
-                </button>
-              )}
-            </div>
           </>
         )}
 

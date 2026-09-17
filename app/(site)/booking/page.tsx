@@ -208,7 +208,7 @@ export default function BookingPage() {
           durationMinutes: selectedOption.durationMinutes,
           customerName: form.name, email: form.email,
           remark: form.remark || undefined,
-          joinClub: form.joinClub,
+          joinClub: lang === 'zh' && form.joinClub,
           lang,
         }),
       })
@@ -637,18 +637,21 @@ export default function BookingPage() {
                     {formErrors.email && <p className="mt-1 text-xs text-red-500">{formErrors.email}</p>}
                   </div>
 
-                  <label className="flex items-start gap-3 rounded-2xl border border-sand-200 bg-warm-50 p-4">
-                    <input
-                      type="checkbox"
-                      className="mt-1"
-                      checked={form.joinClub}
-                      onChange={e => setForm({ ...form, joinClub: e.target.checked })}
-                    />
-                    <span>
-                      <span className="block text-sm font-medium text-charcoal">{p(t.step4JoinClub)}</span>
-                      <span className="mt-1 block text-xs leading-5 text-charcoal-light">{p(t.step4JoinClubHint)}</span>
-                    </span>
-                  </label>
+                  {/* 英文版暂不开放会员制度（业主 2026-09-17）：中文界面才给这个勾选框 */}
+                  {lang === 'zh' && (
+                    <label className="flex items-start gap-3 rounded-2xl border border-sand-200 bg-warm-50 p-4">
+                      <input
+                        type="checkbox"
+                        className="mt-1"
+                        checked={form.joinClub}
+                        onChange={e => setForm({ ...form, joinClub: e.target.checked })}
+                      />
+                      <span>
+                        <span className="block text-sm font-medium text-charcoal">{p(t.step4JoinClub)}</span>
+                        <span className="mt-1 block text-xs leading-5 text-charcoal-light">{p(t.step4JoinClubHint)}</span>
+                      </span>
+                    </label>
+                  )}
 
                   <div>
                     <label className="label" htmlFor="remark">{p(t.step4RemarkLabel)}</label>

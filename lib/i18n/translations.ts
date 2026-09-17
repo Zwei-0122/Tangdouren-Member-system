@@ -338,9 +338,9 @@ export const t = {
   step4DepositOff:   { zh: '✅ 提交后名额立即锁定，无需支付定金，到店结清即可', en: '✅ Your spot is confirmed instantly — no deposit required, just pay on arrival' },
   step4Submitting:   { zh: '处理中…',        en: 'Processing…' },
   step4Submit:       { zh: '确认预约',        en: 'Confirm Booking' },
-  step4JoinClub:     { zh: '顺便加入 Tangdouren Club', en: 'Also join Tangdouren Club' },
-  step4JoinClubHint: { zh: '每次到店计时都累积进度：满 2 次 £2 抵用券，满 5 次 £5，满 8 次本人 85 折加朋友 9 折，满 10 次送一个月 VIP。不想加入也能直接预约。', en: 'Every in-store visit builds progress: 2 visits for a £2 voucher, 5 for £5, 8 for 15% off for you and 10% off for a friend, 10 for a VIP Month. Joining is optional.' },
-  step5MemberJoined: { zh: '✅ 你已加入 Tangdouren Club，到店扫码后就能用自己的手机看到进度。', en: '✅ You have joined Tangdouren Club — scan in store to track your progress on your phone.' },
+  step4JoinClub:     { zh: '顺便加入糖豆人会员', en: 'Also join Tangdouren Membership' },
+  step4JoinClubHint: { zh: '每次到店计时都累积进度：满 2 次 £2 抵用券，满 5 次 £5，满 8 次本人 85 折加朋友 9 折，满 10 次送一张 VIP 月卡。不想加入也能直接预约。', en: 'Every in-store visit builds progress: 2 visits for a £2 voucher, 5 for £5, 8 for 15% off for you and 10% off for a friend, 10 for a VIP Month. Joining is optional.' },
+  step5MemberJoined: { zh: '✅ 你已加入糖豆人会员，到店扫码后就能用自己的手机看到进度。', en: '✅ You have joined Tangdouren Membership — scan in store to track your progress on your phone.' },
   step4NetworkErr:   { zh: '网络错误，请检查连接后重试', en: 'Network error, please check your connection and try again' },
 
   // Step 5 – Done

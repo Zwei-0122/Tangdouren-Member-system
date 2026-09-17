@@ -9,7 +9,7 @@ import { ArrowLeft, Crown, Gift, Link2 } from 'lucide-react'
 import Sidebar from '@/components/admin/Sidebar'
 import MemberProgressBar from '@/components/member/MemberProgressBar'
 import type { MemberDashboard, MemberRewardEntry } from '@/lib/member/service'
-import type { RewardType } from '@/lib/member/member'
+import { londonDateOf, vipRewardState, type RewardType } from '@/lib/member/member'
 
 interface MemberRow {
   member_id:    string
@@ -24,13 +24,21 @@ const rewardLabels: Record<RewardType, string> = {
   FIVE_POUND:      '£5 抵用券',
   PERSONAL_15_OFF: '本人 85 折',
   FRIEND_10_OFF:   '朋友 9 折',
-  VIP_MONTH:       'VIP Month',
+  VIP_MONTH:       'VIP 月卡',
+}
+
+/** VIP 月卡自身的状态由权益日期派生：未激活 / 生效中至 X / 已结束 */
+function vipBadge(entry: MemberRewardEntry): string {
+  const state = vipRewardState(entry.benefit, londonDateOf(new Date()))
+  if (state === 'active') return `生效中 · 至 ${entry.benefit?.expires_on ?? ''}`
+  if (state === 'ended')  return '已结束'
+  return '未激活'
 }
 
 const stateLabels: Record<string, string> = {
   available:     '可用',
   used:          '已使用',
-  paused_by_vip: 'VIP 结束后可用',
+  paused_by_vip: 'VIP 生效中，需在柜台改用',
   transferred:   '已转赠给朋友',
 }
 
@@ -158,14 +166,14 @@ export default function MemberDetailPage() {
 
               {/* ── VIP Month ────────────────────────────────────────── */}
               <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-5 py-4 space-y-3">
-                <h2 className="text-sm font-semibold text-stone-700 flex items-center gap-2"><Crown size={15} /> VIP Month</h2>
+                <h2 className="text-sm font-semibold text-stone-700 flex items-center gap-2"><Crown size={15} /> VIP 月卡</h2>
                 <p className="text-sm text-stone-600">
                   {dashboard?.vip.active_expires_on
                     ? `生效中，有效期至 ${dashboard.vip.active_expires_on}`
-                    : '当前没有生效中的 VIP Month'}
+                    : '当前没有生效中的 VIP 月卡'}
                 </p>
                 <p className="text-xs text-stone-400">
-                  未激活 {dashboard?.vip.ready_to_activate ?? 0} 张 · 已激活过 {dashboard?.vip.activated ?? 0} 张
+                  VIP 月卡：未激活 {dashboard?.vip.ready_to_activate ?? 0} 张 · 历史激活过 {dashboard?.vip.activated ?? 0} 张
                   （同一时间只能有一张生效，到期后不会自动续）
                 </p>
                 {readyVip.length > 0 && (
@@ -187,12 +195,16 @@ export default function MemberDetailPage() {
                     <li key={entry.reward.reward_id} className="rounded-xl border border-stone-100 px-3 py-2">
                       <div className="flex items-center justify-between gap-2">
                         <span className="text-sm text-stone-700">{rewardLabels[entry.reward.reward_type]}</span>
-                        <span className="text-xs text-stone-500">{stateLabels[entry.state] ?? entry.state}</span>
+                        <span className="text-xs text-stone-500">
+                          {entry.reward.reward_type === 'VIP_MONTH'
+                            ? vipBadge(entry)
+                            : stateLabels[entry.state] ?? entry.state}
+                        </span>
                       </div>
                       <p className="text-xs text-stone-400 mt-0.5">
                         第 {entry.cycle_index} 轮 · {fmt(entry.reward.unlocked_at)} 解锁
                         {entry.reward.used_at && ` · ${fmt(entry.reward.used_at)} 使用`}
-                        {entry.benefit?.activated_on && ` · VIP ${entry.benefit.activated_on} 至 ${entry.benefit.expires_on}`}
+                        {entry.reward.reward_type === 'VIP_MONTH' && entry.benefit?.activated_on && ` · ${entry.benefit.activated_on} 激活`}
                         {entry.coupon_code && ` · 内部券 ${entry.coupon_code}`}
                       </p>
                     </li>
@@ -203,7 +215,7 @@ export default function MemberDetailPage() {
                 {friendOpen.length > 0 && (
                   <div className="rounded-xl border border-stone-100 bg-stone-50 px-3 py-3 space-y-2">
                     <p className="text-xs text-stone-500">
-                      转赠朋友 9 折：先在优惠券页生成一张 10% OFF 的普通券，再把券码填在这里关联。关联后这张奖励不能再直接使用。
+                      转赠朋友 9 折：先在优惠券页生成一张 10% 折扣的普通券，再把券码填在这里关联。关联后这张奖励不能再直接使用。
                     </p>
                     <div className="flex gap-2">
                       <input
@@ -261,7 +273,7 @@ export default function MemberDetailPage() {
                     <li key={v.session_id} className="flex items-center justify-between text-sm border border-stone-100 rounded-xl px-3 py-2">
                       <span className="text-stone-700">{v.visit_date}</span>
                       <span className={v.counted_for_progress ? 'text-emerald-600 text-xs' : 'text-amber-600 text-xs'}>
-                        {v.progress_paused ? 'VIP 期间，进度暂停' : '计入进度'}
+                        {v.progress_paused ? '未计入进度（后台补挂）' : '计入进度'}
                       </span>
                     </li>
                   ))}

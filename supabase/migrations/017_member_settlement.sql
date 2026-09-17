@@ -22,6 +22,10 @@
 --   3) 折扣来源是单选枚举（none / coupon / member_reward / vip_month），从结构上排除叠加（PRD 21）。
 --   4) 金额仍由 TypeScript 先算（lib/coupon/coupon.ts），SQL 用自己查到的券或奖励记录复核，
 --      对不上抛错。**改动折扣逻辑必须同时改这两处**，否则会出现预览金额与最终结算不一致。
+--   5) 业主 2026-09-16 口径修正（与 PRD 6.2 / 11.4 不一致，PRD 待 v1.1 更新）：
+--      ① VIP 生效期间折扣默认走 VIP，店员可在结算台手动改用券或会员奖励，当次放弃 VIP 折扣；
+--      ② VIP 期间进度照常累积，不再暂停。
+--   6) 已结算的散客单允许在后台账补挂到会员名下，只记到店次数，不追折扣、不补发奖励。
 -- ============================================================
 
 -- ── 1. member_rewards ────────────────────────────────────────────────────────
@@ -352,12 +356,15 @@ BEGIN
     RAISE EXCEPTION 'MULTIPLE_DISCOUNT_SOURCES' USING ERRCODE = 'P0001';
   END IF;
 
-  -- 3. VIP 生效期间强制走 VIP 折扣（PRD 11.4 / 21）。
-  --    这里故意抛错而不是静默改写：TypeScript 侧的预览必须同步改，否则预览金额与最终结算会不一致。
+  -- 3. VIP 生效期间默认走 VIP 折扣（PRD 11.4 / 21 + 业主 2026-09-16 口径）。
+  --    默认 = vip_month；但店员可以在柜台手动改用券或会员奖励，当次放弃 VIP 折扣，
+  --    VIP 的 30 天不会因此顺延。折扣类型与数值照样落在快照列里，报表可查。
+  --    这里只拦「不打折」：VIP 会员按原价结账只会是漏选，不是业务意图。
+  --    故意抛错而不是静默改写：TypeScript 侧的预览必须同步改，否则预览金额与最终结算会不一致。
   IF v_session.member_id IS NOT NULL THEN
     v_vip_active := member_vip_active(v_session.member_id);
   END IF;
-  IF v_vip_active AND v_source <> 'vip_month' THEN
+  IF v_vip_active AND v_source = 'none' THEN
     RAISE EXCEPTION 'VIP_MUST_BE_APPLIED' USING ERRCODE = 'P0001';
   END IF;
 
@@ -478,11 +485,14 @@ BEGIN
   END IF;
 
   -- 5. 固化本次消费是否计入 Reward Progress（PRD 19.2）。
-  --    散客单不判定，留 NULL；会员单在结算这一刻看有没有生效中的 VIP。
+  --    散客单不判定，留 NULL；会员单一律计入。
+  --    业主 2026-09-16 口径：VIP 期间进度照常累积，不再按「有没有生效中的 VIP」暂停。
+  --    所以 false 现在只有一个来源：后台把已结算的散客单补挂到会员名下（见第 7 节），
+  --    那一单只算 Lifetime Visits、不走进度。
   IF v_session.member_id IS NULL THEN
     v_reward_eligible := NULL;
   ELSE
-    v_reward_eligible := NOT v_vip_active;
+    v_reward_eligible := TRUE;
   END IF;
 
   -- 会员券类奖励的内部券码，仅作快照留痕，顾客端不展示
@@ -693,8 +703,11 @@ $$;
 -- ── 7. 后台动作：把订单关联到会员、激活 VIP Month ────────────────────────────
 
 -- 顾客以散客身份开始计时后才想起自己是会员时，店员在后台把订单挂到会员名下（PRD 5.2）。
--- 只允许挂「尚未结算」的单：进度必须来自真实结算记录，已结算的单要先撤销结算再挂，
--- 否则等于绕过结算台账手动改数字（PRD 16.3、18）。
+-- 业主 2026-09-16 口径：已结算的单也允许补挂，但只补「这一单是他来的」，
+-- 不追折扣、不补发奖励、不动已收金额，所以这一单写 reward_eligible = false，
+-- 只进 Lifetime Visits、不进 Reward Progress。
+-- 守两条线：① 已归属到别的会员的单不再改归属，否则等于把一次到店从甲挪到乙；
+--           ② 未结算的单挂上后 reward_eligible 留 NULL，等结算时按会员单判定。
 CREATE OR REPLACE FUNCTION public.link_timer_session_to_member(
   p_session_id text,
   p_member_id  uuid
@@ -714,13 +727,17 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'SESSION_NOT_FOUND' USING ERRCODE = 'P0001';
   END IF;
-  IF v_session.is_settled THEN
-    RAISE EXCEPTION 'SESSION_ALREADY_SETTLED' USING ERRCODE = 'P0001';
+  -- 已结算的单只允许「补挂」，不允许改归属
+  IF v_session.is_settled
+     AND v_session.member_id IS NOT NULL
+     AND v_session.member_id IS DISTINCT FROM p_member_id THEN
+    RAISE EXCEPTION 'SESSION_ALREADY_LINKED' USING ERRCODE = 'P0001';
   END IF;
 
   UPDATE timer_sessions SET
     member_id       = p_member_id,
-    reward_eligible = NULL          -- 结算时才判定，避免留下未经验证的进度资格
+    -- 未结算的等结算时判定；已结算的补挂只记「他来过」，不计进度
+    reward_eligible = CASE WHEN v_session.is_settled THEN FALSE ELSE NULL END
   WHERE session_id = p_session_id
   RETURNING * INTO v_session;
 

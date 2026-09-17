@@ -151,8 +151,10 @@ export async function PATCH(
       ? await getMemberSettleInfo(admin, sponsorMemberId, londonDateOf(new Date()))
       : null
 
-    // 没显式指定来源时：本单会员有生效中的 VIP 就强制走 VIP（PRD 11.4），
+    // 没显式指定来源时：本单会员有生效中的 VIP 就默认走 VIP（PRD 11.4），
     // 否则按有没有券码决定用券还是不用优惠。
+    // 前端显式传来源的情况里包含「VIP 期间店员手动改用券或奖励」（业主 2026-09-16 口径），
+    // 那条路径同样由数据库复核金额，最终以服务端算出来的为准。
     const source: DiscountSource = body.discount_source
       ?? (memberInfo?.vipActive && sponsorMemberId === sessionMemberId ? 'vip_month'
         : body.coupon_code ? 'coupon'

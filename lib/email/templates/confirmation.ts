@@ -17,6 +17,8 @@ export interface ConfirmationEmailData {
   studioEmail:     string
   studioMapUrl?:   string
   lang?:           'zh' | 'en'
+  /** 这次预约同时加入了糖豆人会员（PRD 2.3）。英文版暂不开放会员，因此只写中文那一句 */
+  memberJoined?:   boolean
 }
 
 export function buildConfirmationEmail(data: ConfirmationEmailData): {
@@ -29,6 +31,7 @@ export function buildConfirmationEmail(data: ConfirmationEmailData): {
     studioName, studioAddress, studioEmail,
     studioMapUrl = 'https://maps.google.com/?q=糖豆人手作',
     lang = 'zh',
+    memberJoined = false,
   } = data
 
   const locationUrl = `${process.env.NEXT_PUBLIC_APP_URL ?? 'https://www.tangdouren.co.uk'}/location`
@@ -57,6 +60,13 @@ export function buildConfirmationEmail(data: ConfirmationEmailData): {
     : (isEn
         ? `✅ Booking confirmed — no deposit required. Pay in full on arrival.`
         : `✅ 预约已确认，无需预付定金，到店结清即可`)
+
+  // 加入会员只在中文预约里发生（英文版不开放会员），所以这一句只有中文版
+  const memberBadge = memberJoined && !isEn
+    ? `<div style="background:#fdf1ee;border:1px solid #f3d6cd;border-radius:8px;padding:12px 16px;margin-bottom:24px;font-size:14px;color:#8a4a35;line-height:1.6;">
+        🎉 你已加入<strong>糖豆人会员</strong>：每次到店计时都累积进度，满 2 次得 £2 抵用券，满 5 次得 £5，满 10 次解锁 VIP 月卡。到店扫桌上的二维码，就能在自己的手机上查看进度。
+      </div>`
+    : ''
 
   const locationWarning = isEn
     ? `⚠️ Our studio is inside an office building and can be a little tricky to find on your first visit. Please read the Location Guide <strong>before you leave home</strong>!`
@@ -151,6 +161,8 @@ export function buildConfirmationEmail(data: ConfirmationEmailData): {
       </div>
 
       <div class="deposit-badge">${depositBadge}</div>
+
+      ${memberBadge}
 
       <div class="policy-box">
         <strong>${policyTitle}</strong><br />

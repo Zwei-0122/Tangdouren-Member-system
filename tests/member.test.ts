@@ -31,6 +31,7 @@ import {
   usableRewardTypes,
   vipExpiresOn,
   vipMonthSummary,
+  vipRewardState,
   type MemberRewardRow,
   type RewardType,
   type VisitSessionRow,
@@ -125,7 +126,7 @@ test('散客单与未结算单都不计入', () => {
   assert.equal(countRewardProgress(visits), 0)
 })
 
-test('VIP 期间 Lifetime 加、Reward Progress 不加，两个数因此会不同', () => {
+test('后台补挂的已结算单进 Lifetime、不走进度，两个数因此会不同', () => {
   const visits = buildVisitDays([
     session('2026-09-10T12:00:00Z', { reward_eligible: true }),
     session('2026-09-11T12:00:00Z', { reward_eligible: false }),
@@ -135,8 +136,8 @@ test('VIP 期间 Lifetime 加、Reward Progress 不加，两个数因此会不�
   assert.equal(countRewardProgress(visits), 1)
 })
 
-test('VIP 激活当天：激活前完成的那条进度不回退', () => {
-  // 同一天两条单，一条在激活前（eligible），一条在激活后（不 eligible）
+test('同一天只要有一条计入进度，这一天就算（补挂不会回退已完成的进度）', () => {
+  // 同一天两条单：一条计入进度，一条（后台补挂）不计入
   const visits = buildVisitDays([
     session('2026-09-18T09:00:00Z', { reward_eligible: true }),
     session('2026-09-18T18:00:00Z', { reward_eligible: false, session_id: 'T-2' }),
@@ -235,7 +236,7 @@ test('奖励节点表就是 PRD 第 7 节那张表', () => {
 
 // ── 奖励可用性 ──────────────────────────────────────────────────────────────
 
-test('奖励状态：已用 > 已转赠 > VIP 期间暂停 > 可用', () => {
+test('奖励状态：已用 > 已转赠 > VIP 生效中（顾客不可自行使用）> 可用', () => {
   assert.equal(rewardState(reward('TWO_POUND', { used_at: '2026-09-20T10:00:00Z' }), false), 'used')
   assert.equal(rewardState(reward('FRIEND_10_OFF', { coupon_id: 'coupon-x' }), false), 'transferred')
   assert.equal(rewardState(reward('PERSONAL_15_OFF'), true), 'paused_by_vip')
@@ -251,17 +252,16 @@ test('VIP 期间其他奖励继续显示，只是标成不可用', () => {
 test('同类多张时挑最早解锁的那张，与 SQL 的排序一致', () => {
   const older = reward('TWO_POUND', { reward_id: 'reward-a', unlocked_at: '2026-09-01T10:00:00Z' })
   const newer = reward('TWO_POUND', { reward_id: 'reward-b', unlocked_at: '2026-09-05T10:00:00Z' })
-  assert.equal(pickRewardForUse([newer, older], 'TWO_POUND', false)?.reward_id, 'reward-a')
+  assert.equal(pickRewardForUse([newer, older], 'TWO_POUND')?.reward_id, 'reward-a')
 })
 
-test('挑券时跳过已用、已转赠与 VIP 暂停的', () => {
+test('挑券时跳过已用、已转赠的（VIP 期间也能挑，供店员手动改用）', () => {
   const used = reward('TWO_POUND', { reward_id: 'reward-a', used_at: '2026-09-20T10:00:00Z' })
   const ok = reward('TWO_POUND', { reward_id: 'reward-b' })
-  assert.equal(pickRewardForUse([used, ok], 'TWO_POUND', false)?.reward_id, 'reward-b')
-  assert.equal(pickRewardForUse([ok], 'TWO_POUND', true), null)
+  assert.equal(pickRewardForUse([used, ok], 'TWO_POUND')?.reward_id, 'reward-b')
 
   const transferred = reward('FRIEND_10_OFF', { reward_id: 'reward-c', coupon_id: 'coupon-x' })
-  assert.equal(pickRewardForUse([transferred], 'FRIEND_10_OFF', false), null)
+  assert.equal(pickRewardForUse([transferred], 'FRIEND_10_OFF'), null)
 })
 
 test('结算台可选奖励去重后按类型给出', () => {
@@ -271,8 +271,7 @@ test('结算台可选奖励去重后按类型给出', () => {
     reward('PERSONAL_15_OFF', { reward_id: 'reward-c' }),
     reward('VIP_MONTH', { reward_id: 'reward-d' }),
   ]
-  assert.deepEqual(usableRewardTypes(rewards, false), ['TWO_POUND', 'PERSONAL_15_OFF'])
-  assert.deepEqual(usableRewardTypes(rewards, true), [])
+  assert.deepEqual(usableRewardTypes(rewards), ['TWO_POUND', 'PERSONAL_15_OFF'])
 })
 
 // ── VIP Month ───────────────────────────────────────────────────────────────
@@ -302,6 +301,17 @@ test('未激活的 VIP Month 不生效', () => {
   }
   assert.equal(isVipBenefitActiveOn(notActivated, '2026-09-18'), false)
   assert.equal(isVipActive([notActivated], '2026-09-18'), false)
+})
+
+test('VIP 月卡奖励自身的状态：未激活 / 生效中（含到期日）/ 已结束', () => {
+  const pending = { benefit_id: 'b1', reward_id: 'r1', activated_on: null, expires_on: null }
+  const running = { benefit_id: 'b2', reward_id: 'r2', activated_on: '2026-09-17', expires_on: '2026-10-16' }
+
+  assert.equal(vipRewardState(pending, '2026-09-20'), 'ready')
+  assert.equal(vipRewardState(running, '2026-09-17'), 'active')   // 激活当天
+  assert.equal(vipRewardState(running, '2026-10-16'), 'active')   // 到期日当天仍生效
+  assert.equal(vipRewardState(running, '2026-10-17'), 'ended')    // 次日结束
+  assert.equal(vipRewardState(null, '2026-09-20'), null)          // 不是月卡（没有权益行）
 })
 
 test('可以累计多张未激活的 VIP Month，同一时间只有一张生效', () => {
@@ -365,9 +375,16 @@ test('不打折时金额原样返回', () => {
   assert.equal(none.ok && none.preview.finalGbp, 25.99)
 })
 
-test('VIP 生效期间强制走 VIP，其他会员奖励一律拒绝', () => {
-  const blocked = computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: true, rewardType: 'TWO_POUND' })
+test('VIP 生效期间：不选优惠被拒，手动改用券或奖励放行（业主 2026-09-16 口径）', () => {
+  // 默认走 VIP，但「什么都不选」会让 VIP 会员按原价结账，属于漏选，必须拦住
+  const blocked = computeMemberDiscount('none', { amountGbp: 13.99, vipActive: true })
   assert.deepEqual(blocked, { ok: false, error: 'VIP_MUST_BE_APPLIED' })
+
+  // 店员在柜台改用会员奖励：当次放弃 VIP 折扣，金额按奖励算
+  const overridden = computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: true, rewardType: 'TWO_POUND' })
+  assert.equal(overridden.ok, true)
+  if (overridden.ok) assert.equal(overridden.preview.discountAmountPence, 200)
+
   const notVip = computeMemberDiscount('vip_month', { amountGbp: 13.99, vipActive: false })
   assert.deepEqual(notVip, { ok: false, error: 'VIP_NOT_ACTIVE' })
 })

@@ -13,8 +13,7 @@ import {
   isVipActive,
   londonDateOf,
   maskEmail,
-  rewardState,
-  USABLE_REWARD_TYPES,
+  usableRewardTypes,
   nextReward,
   normalizeMemberEmail,
   progressBarCells,
@@ -131,7 +130,7 @@ export interface MemberVisitEntry {
   visit_date:            string
   started_at:            string
   counted_for_progress:  boolean
-  progress_paused:       boolean          // VIP 期间：Lifetime 加、Progress 不加（PRD 14）
+  progress_paused:       boolean          // 这次到店是否计入奖励进度（false = 后台补挂，只计 Lifetime）
   used_reward:           RewardType | null
   used_vip:              boolean
 }
@@ -167,7 +166,7 @@ export interface MemberDashboard {
 async function loadMemberSessions(admin: AdminClient, memberId: string, limit: number) {
   const { data, error } = await admin
     .from('timer_sessions')
-    .select('session_id, member_id, started_at, is_settled, reward_eligible, amount_gbp, actual_amount_gbp')
+    .select('session_id, member_id, started_at, is_settled, reward_eligible, amount_gbp, actual_amount_gbp, discount_amount_gbp, coupon_code_snapshot')
     .eq('member_id', memberId)
     .order('started_at', { ascending: false })
     .limit(limit)
@@ -233,7 +232,12 @@ export async function getMemberDashboard(
       counted_for_progress: Boolean(s.reward_eligible),
       progress_paused:      s.reward_eligible === false,
       used_reward:          usedBySession.get(s.session_id) ?? null,
-      used_vip:             s.reward_eligible === false,
+      // 这单是不是走的 VIP 折扣：有折扣金额、没走券也没走奖励，剩下来只有 VIP。
+      // 业主 2026-09-16 之前这里靠 reward_eligible 判断（那时它等于「结算时 VIP 生效」），
+      // 进度不再暂停后那个代理失效，改用折扣快照列。
+      used_vip:             (s.discount_amount_gbp ?? 0) > 0
+                              && !s.coupon_code_snapshot
+                              && !usedBySession.has(s.session_id),
     }))
 
   return {
@@ -309,10 +313,8 @@ export async function getMemberSettleInfo(
     member,
     vipActive,
     vipExpiresOn: activeBenefit?.expires_on ?? null,
-    usableTypes:  rewards.filter(r => USABLE_REWARD_TYPES.includes(r.reward_type))
-                         .filter(r => rewardState(r, vipActive) === 'available')
-                         .map(r => r.reward_type)
-                         .filter((t, i, arr) => arr.indexOf(t) === i),
+      // 不按 VIP 过滤：VIP 生效期间结算台也要列出奖励，店员可以手动改用（业主 2026-09-16 口径）
+    usableTypes:  usableRewardTypes(rewards),
     rewards,
   }
 }
@@ -335,7 +337,8 @@ export function mapMemberError(message: string | undefined | null): string {
     ['MEMBER_BENEFITS_FAILED',          '读取 VIP 记录失败，请重试'],
     ['MEMBER_LIST_FAILED',              '读取会员列表失败，请重试'],
     ['SESSION_NOT_FOUND',               '计时订单不存在'],
-    ['SESSION_ALREADY_SETTLED',         '该订单已结算，请先撤销结算再关联会员'],
+    ['SESSION_ALREADY_SETTLED',         '该订单已经结算过了'],
+    ['SESSION_ALREADY_LINKED',          '该订单已经属于别的会员，不能改归属'],
     ['MEMBER_REQUIRED',                 '该订单没有关联会员'],
     ['MEMBER_SESSION_MISMATCH',         '这类奖励只能用于本人的订单，请先把订单关联到会员'],
     ['MEMBER_REWARD_NOT_FOUND',         '找不到该奖励'],

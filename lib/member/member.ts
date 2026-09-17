@@ -124,6 +124,26 @@ export function isVipActive(benefits: VipBenefitRow[], londonDate: string): bool
   return benefits.some(b => isVipBenefitActiveOn(b, londonDate))
 }
 
+/**
+ * VIP 月卡这类奖励**自身**的状态，由权益日期派生（不存状态字段）：
+ *   ready  = 已解锁、还没激活
+ *   active = 生效中（到期日当天仍算生效）
+ *   ended  = 已经过期
+ * 传进来的不是 VIP 月卡（没有权益行）时返回 null，交给调用方按普通奖励处理。
+ * 日期都是伦敦当地 YYYY-MM-DD，字符串比较即可（同 isVipBenefitActiveOn 的口径）。
+ */
+export type VipRewardState = 'ready' | 'active' | 'ended'
+
+export function vipRewardState(
+  benefit: VipBenefitRow | null | undefined,
+  londonToday: string,
+): VipRewardState | null {
+  if (!benefit) return null
+  if (!benefit.activated_on) return 'ready'
+  if (benefit.expires_on && benefit.expires_on < londonToday) return 'ended'
+  return 'active'
+}
+
 // ── Visit 口径（与 member_visit_days 视图同口径）────────────────────────────
 
 export interface VisitSessionRow {
@@ -132,6 +152,9 @@ export interface VisitSessionRow {
   started_at:      string
   is_settled:      boolean
   reward_eligible: boolean | null
+  /** 下面两个只有会员页要用来区分「这次是不是走了 VIP 折扣」，Visit 口径本身不需要 */
+  discount_amount_gbp?: number | null
+  coupon_code_snapshot?: string | null
 }
 
 export interface VisitDay {
@@ -160,7 +183,11 @@ export function countLifetimeVisits(visits: VisitDay[]): number {
   return visits.length
 }
 
-/** Reward Progress：只认计入进度的访日。VIP 期间 Lifetime 加、Progress 不加（PRD 6.2） */
+/**
+ * Reward Progress：只认计入进度的访日。
+ * 业主 2026-09-16 口径：VIP 期间进度照常累积，所以 false 只来自后台补挂的已结算单，
+ * 那一单进 Lifetime、不进 Progress。
+ */
 export function countRewardProgress(visits: VisitDay[]): number {
   return visits.filter(v => v.reward_eligible).length
 }
@@ -260,7 +287,10 @@ export interface RewardAvailability {
 
 /**
  * 单个奖励当前能不能用。顺序不能变：
- *   已用 → 已转赠成券（Friend 10% 转赠后不能再用，PRD 10.4）→ VIP 期间暂停（PRD 11.4）→ 可用
+ *   已用 → 已转赠成券（Friend 10% 转赠后不能再用，PRD 10.4）→ VIP 生效中 → 可用
+ *
+ * paused_by_vip 的含义是「顾客端不能自行使用」：业主 2026-09-16 口径下，VIP 期间进度照常累积、
+ * 奖励也不作废，店员可以在结算台手动改用（见 computeMemberDiscount），所以它拦的是顾客自助那条路。
  */
 export function rewardState(reward: MemberRewardRow, vipActive: boolean): RewardState {
   if (reward.used_at) return 'used'
@@ -269,7 +299,7 @@ export function rewardState(reward: MemberRewardRow, vipActive: boolean): Reward
   return 'available'
 }
 
-/** My Rewards 列表：VIP 期间其他奖励继续显示、只是标成不可用，不隐藏（PRD 11.4、13.1） */
+/** My Rewards 列表：VIP 生效期间其他奖励继续显示、只标成顾客端不可自行使用，不隐藏（PRD 13.1） */
 export function rewardAvailabilityList(
   rewards: MemberRewardRow[],
   vipActive: boolean,
@@ -284,22 +314,26 @@ export function rewardAvailabilityList(
 export function pickRewardForUse(
   rewards: MemberRewardRow[],
   rewardType: RewardType,
-  vipActive: boolean,
   excludeSessionId?: string | null,
 ): MemberRewardRow | null {
+  // 不按 VIP 过滤：VIP 期间店员可以手动改用（业主 2026-09-16 口径），
+  // 顾客端的限制由 rewardAvailabilityList 负责。
   const candidates = rewards
     .filter(r => r.reward_type === rewardType)
-    .filter(r => rewardState(r, vipActive) === 'available')
+    .filter(r => rewardState(r, false) === 'available')
     .filter(r => !excludeSessionId || r.reward_id !== excludeSessionId)
     .sort((a, b) => a.unlocked_at.localeCompare(b.unlocked_at) || a.reward_id.localeCompare(b.reward_id))
   return candidates[0] ?? null
 }
 
-/** 会员当前可选的奖励类型（去重，供结算台下拉用；PRD 21） */
-export function usableRewardTypes(rewards: MemberRewardRow[], vipActive: boolean): RewardType[] {
+/**
+ * 会员当前可选的奖励类型（去重，供结算台下拉用；PRD 21）。
+ * 同样不按 VIP 过滤：VIP 期间结算台要能列出奖励供店员手动改用（业主 2026-09-16 口径）。
+ */
+export function usableRewardTypes(rewards: MemberRewardRow[]): RewardType[] {
   const types = rewards
     .filter(r => USABLE_REWARD_TYPES.includes(r.reward_type))
-    .filter(r => rewardState(r, vipActive) === 'available')
+    .filter(r => rewardState(r, false) === 'available')
     .map(r => r.reward_type)
   return [...new Set(types)]
 }
@@ -395,8 +429,9 @@ export function computeMemberDiscount(
   }
   const prePence = toPence(ctx.amountGbp)
 
-  // VIP 生效期间系统强制走 VIP 折扣，店员不能改用其他会员奖励（PRD 11.4、21）
-  if (ctx.vipActive && source !== 'vip_month') {
+  // VIP 生效期间默认走 VIP 折扣；只有「不打折」被拒。
+  // 业主 2026-09-16 口径：店员可以在柜台改用券或会员奖励，当次放弃 VIP 折扣，VIP 的 30 天不顺延。
+  if (ctx.vipActive && source === 'none') {
     return { ok: false, error: 'VIP_MUST_BE_APPLIED' }
   }
 
