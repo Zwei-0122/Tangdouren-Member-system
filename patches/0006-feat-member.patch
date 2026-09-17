@@ -1,0 +1,1748 @@
+From 01a61722f6aad941b48631ba41ffb55d9a357202 Mon Sep 17 00:00:00 2001
+From: Zwei-0122 <325088970+Zwei-0122@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 01:53:01 +0100
+Subject: [PATCH 6/8] =?UTF-8?q?feat(member):=20=E4=BC=9A=E5=91=98=E5=8F=A3?=
+ =?UTF-8?q?=E5=BE=84=E4=BF=AE=E6=AD=A3=E3=80=81=E7=95=8C=E9=9D=A2=E5=85=A8?=
+ =?UTF-8?q?=E4=B8=AD=E6=96=87=E3=80=81=E5=A5=96=E5=8A=B1=E8=AF=B4=E6=98=8E?=
+ =?UTF-8?q?=E4=B8=8E=E7=8A=B6=E6=80=81=E8=A1=A5=E9=BD=90?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+口径（业主 2026-09-16 确认）：
+- VIP 月卡生效期间，柜台可把折扣改用某张券或会员奖励，但不允许覆盖成「不使用优惠」
+- VIP 期间到店进度照常累积，不再暂停
+- 允许把已结算订单补挂到会员（记 reward_eligible=false，只进累计到店，不进奖励进度）
+- 已归属某会员的订单不允许改挂到别的会员（SESSION_ALREADY_LINKED）
+
+界面：
+- 会员文案全中文：Tangdouren Membership → 糖豆人会员页 / 糖豆人会员；VIP Month → VIP 月卡
+- 进度条四个奖励节点加说明（后台鼠标悬停、顾客端点一下展开）
+- 「我的奖励」与「奖励记录」合并为一栏，每行显示状态与日期
+- VIP 月卡自身状态按权益日期派生：未激活 / 生效中至 X / 已结束
+- 英文版暂不开放会员制度：入口、预约勾选框、会员页均不出现（服务端同步拦截）
+
+其他：
+- 中文预约的确认邮件补一句会员身份
+- 迁移与验收脚本同步（verify_via_api.py 64 项断言）
+- 测试：node --test 77 项通过、tsc 0 error、next build 通过、测试库真实数据验收 64/64
+---
+ app/(admin)/dashboard/members/[id]/page.tsx   |  32 ++--
+ app/(admin)/dashboard/members/page.tsx        |   2 +-
+ app/(admin)/dashboard/timers/[id]/page.tsx    |  47 ++++--
+ app/(site)/booking/page.tsx                   |  29 ++--
+ app/(site)/self-timer/club/page.tsx           | 148 +++++++++++-------
+ app/(site)/self-timer/page.tsx                |  31 ++--
+ app/api/admin/timers/[id]/route.ts            |   4 +-
+ app/api/bookings/route.ts                     |   8 +-
+ components/member/MemberProgressBar.tsx       | 104 ++++++++----
+ docs/verify_member_system.sql                 |  44 ++++--
+ docs/verify_via_api.py                        |  48 ++++--
+ ...0\346\254\241\346\211\247\350\241\214.sql" |  39 +++--
+ ...44\344\273\230\350\257\264\346\230\216.md" |  17 +-
+ ...00\351\241\265\350\257\264\346\230\216.md" |  15 +-
+ lib/email/templates/confirmation.ts           |  12 ++
+ lib/i18n/translations.ts                      |   6 +-
+ lib/member/member.ts                          |  55 +++++--
+ lib/member/service.ts                         |  23 +--
+ supabase/migrations/017_member_settlement.sql |  37 +++--
+ tests/member.test.ts                          |  43 +++--
+ 20 files changed, 510 insertions(+), 234 deletions(-)
+
+diff --git a/app/(admin)/dashboard/members/[id]/page.tsx b/app/(admin)/dashboard/members/[id]/page.tsx
+index e003972..dc0b7a4 100644
+--- a/app/(admin)/dashboard/members/[id]/page.tsx
++++ b/app/(admin)/dashboard/members/[id]/page.tsx
+@@ -9,7 +9,7 @@ import { ArrowLeft, Crown, Gift, Link2 } from 'lucide-react'
+ import Sidebar from '@/components/admin/Sidebar'
+ import MemberProgressBar from '@/components/member/MemberProgressBar'
+ import type { MemberDashboard, MemberRewardEntry } from '@/lib/member/service'
+-import type { RewardType } from '@/lib/member/member'
++import { londonDateOf, vipRewardState, type RewardType } from '@/lib/member/member'
+ 
+ interface MemberRow {
+   member_id:    string
+@@ -24,13 +24,21 @@ const rewardLabels: Record<RewardType, string> = {
+   FIVE_POUND:      '£5 抵用券',
+   PERSONAL_15_OFF: '本人 85 折',
+   FRIEND_10_OFF:   '朋友 9 折',
+-  VIP_MONTH:       'VIP Month',
++  VIP_MONTH:       'VIP 月卡',
++}
++
++/** VIP 月卡自身的状态由权益日期派生：未激活 / 生效中至 X / 已结束 */
++function vipBadge(entry: MemberRewardEntry): string {
++  const state = vipRewardState(entry.benefit, londonDateOf(new Date()))
++  if (state === 'active') return `生效中 · 至 ${entry.benefit?.expires_on ?? ''}`
++  if (state === 'ended')  return '已结束'
++  return '未激活'
+ }
+ 
+ const stateLabels: Record<string, string> = {
+   available:     '可用',
+   used:          '已使用',
+-  paused_by_vip: 'VIP 结束后可用',
++  paused_by_vip: 'VIP 生效中，需在柜台改用',
+   transferred:   '已转赠给朋友',
+ }
+ 
+@@ -158,14 +166,14 @@ export default function MemberDetailPage() {
+ 
+               {/* ── VIP Month ────────────────────────────────────────── */}
+               <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-5 py-4 space-y-3">
+-                <h2 className="text-sm font-semibold text-stone-700 flex items-center gap-2"><Crown size={15} /> VIP Month</h2>
++                <h2 className="text-sm font-semibold text-stone-700 flex items-center gap-2"><Crown size={15} /> VIP 月卡</h2>
+                 <p className="text-sm text-stone-600">
+                   {dashboard?.vip.active_expires_on
+                     ? `生效中，有效期至 ${dashboard.vip.active_expires_on}`
+-                    : '当前没有生效中的 VIP Month'}
++                    : '当前没有生效中的 VIP 月卡'}
+                 </p>
+                 <p className="text-xs text-stone-400">
+-                  未激活 {dashboard?.vip.ready_to_activate ?? 0} 张 · 已激活过 {dashboard?.vip.activated ?? 0} 张
++                  VIP 月卡：未激活 {dashboard?.vip.ready_to_activate ?? 0} 张 · 历史激活过 {dashboard?.vip.activated ?? 0} 张
+                   （同一时间只能有一张生效，到期后不会自动续）
+                 </p>
+                 {readyVip.length > 0 && (
+@@ -187,12 +195,16 @@ export default function MemberDetailPage() {
+                     <li key={entry.reward.reward_id} className="rounded-xl border border-stone-100 px-3 py-2">
+                       <div className="flex items-center justify-between gap-2">
+                         <span className="text-sm text-stone-700">{rewardLabels[entry.reward.reward_type]}</span>
+-                        <span className="text-xs text-stone-500">{stateLabels[entry.state] ?? entry.state}</span>
++                        <span className="text-xs text-stone-500">
++                          {entry.reward.reward_type === 'VIP_MONTH'
++                            ? vipBadge(entry)
++                            : stateLabels[entry.state] ?? entry.state}
++                        </span>
+                       </div>
+                       <p className="text-xs text-stone-400 mt-0.5">
+                         第 {entry.cycle_index} 轮 · {fmt(entry.reward.unlocked_at)} 解锁
+                         {entry.reward.used_at && ` · ${fmt(entry.reward.used_at)} 使用`}
+-                        {entry.benefit?.activated_on && ` · VIP ${entry.benefit.activated_on} 至 ${entry.benefit.expires_on}`}
++                        {entry.reward.reward_type === 'VIP_MONTH' && entry.benefit?.activated_on && ` · ${entry.benefit.activated_on} 激活`}
+                         {entry.coupon_code && ` · 内部券 ${entry.coupon_code}`}
+                       </p>
+                     </li>
+@@ -203,7 +215,7 @@ export default function MemberDetailPage() {
+                 {friendOpen.length > 0 && (
+                   <div className="rounded-xl border border-stone-100 bg-stone-50 px-3 py-3 space-y-2">
+                     <p className="text-xs text-stone-500">
+-                      转赠朋友 9 折：先在优惠券页生成一张 10% OFF 的普通券，再把券码填在这里关联。关联后这张奖励不能再直接使用。
++                      转赠朋友 9 折：先在优惠券页生成一张 10% 折扣的普通券，再把券码填在这里关联。关联后这张奖励不能再直接使用。
+                     </p>
+                     <div className="flex gap-2">
+                       <input
+@@ -261,7 +273,7 @@ export default function MemberDetailPage() {
+                     <li key={v.session_id} className="flex items-center justify-between text-sm border border-stone-100 rounded-xl px-3 py-2">
+                       <span className="text-stone-700">{v.visit_date}</span>
+                       <span className={v.counted_for_progress ? 'text-emerald-600 text-xs' : 'text-amber-600 text-xs'}>
+-                        {v.progress_paused ? 'VIP 期间，进度暂停' : '计入进度'}
++                        {v.progress_paused ? '未计入进度（后台补挂）' : '计入进度'}
+                       </span>
+                     </li>
+                   ))}
+diff --git a/app/(admin)/dashboard/members/page.tsx b/app/(admin)/dashboard/members/page.tsx
+index a523cc0..d157898 100644
+--- a/app/(admin)/dashboard/members/page.tsx
++++ b/app/(admin)/dashboard/members/page.tsx
+@@ -48,7 +48,7 @@ export default function MembersPage() {
+         <div className="max-w-3xl mx-auto p-4 md:p-6 space-y-6">
+           <div className="flex items-center justify-between">
+             <h1 className="text-xl font-bold text-stone-800 flex items-center gap-2">
+-              <Users size={18} /> Tangdouren Club 会员
++              <Users size={18} /> 糖豆人会员
+             </h1>
+             <span className="text-xs text-stone-400">共 {members.length} 位</span>
+           </div>
+diff --git a/app/(admin)/dashboard/timers/[id]/page.tsx b/app/(admin)/dashboard/timers/[id]/page.tsx
+index 8bc27b5..728697f 100644
+--- a/app/(admin)/dashboard/timers/[id]/page.tsx
++++ b/app/(admin)/dashboard/timers/[id]/page.tsx
+@@ -67,7 +67,7 @@ const memberRewardLabels: Record<RewardType, string> = {
+   FIVE_POUND:      '£5 抵用券',
+   PERSONAL_15_OFF: '本人 85 折',
+   FRIEND_10_OFF:   '朋友 9 折',
+-  VIP_MONTH:       'VIP Month',
++  VIP_MONTH:       'VIP 月卡',
+ }
+ 
+ function calcElapsed(session: TimerSession): number {
+@@ -397,14 +397,17 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
+   const [saving,     setSaving]     = useState(false)
+   const [error,      setError]      = useState('')
+   const [rewardType, setRewardType] = useState<RewardType | null>(null)
++  const [overrideVip, setOverrideVip] = useState(false)
+ 
+-  // VIP 生效期间系统强制走 VIP 85 折，店员不能改用其他会员奖励（PRD 11.4）
+-  const vipActive = Boolean(member?.vip_active)
++  // VIP 生效期间默认走 VIP 85 折；店员可以打开「改用其他优惠」手动改用券或奖励，
++  // 当次放弃 VIP 折扣，VIP 的 30 天不顺延（业主 2026-09-16 口径）
++  const vipActive  = Boolean(member?.vip_active)
++  const vipDefault = vipActive && !overrideVip
+ 
+   /** 会员折扣的预览。金额规则与数据库复核用的是同一套（lib/member/member.ts） */
+   const memberPreview = (() => {
+     if (!member) return null
+-    const effective: DiscountSource = vipActive ? 'vip_month' : rewardType ? 'member_reward' : 'none'
++    const effective: DiscountSource = vipDefault ? 'vip_month' : rewardType ? 'member_reward' : 'none'
+     if (effective === 'none') return null
+     const computed = computeMemberDiscount(effective, {
+       amountGbp:  session.amount_gbp,
+@@ -461,7 +464,7 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
+           {session.reward_eligible === false && (
+             <div className="flex justify-between">
+               <span className="text-stone-500">本次进度</span>
+-              <span className="font-medium text-amber-700">VIP 期间，不计入 Reward Progress</span>
++              <span className="font-medium text-amber-700">后台补挂，不计入奖励进度</span>
+             </div>
+           )}
+           <div className="flex justify-between pt-1.5 border-t border-emerald-200">
+@@ -522,12 +525,17 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
+ 
+   async function handleSettle() {
+     // 一次结算只能有一个折扣来源（PRD 21）
+-    const effectiveSource: DiscountSource = vipActive
++    const effectiveSource: DiscountSource = vipDefault
+       ? 'vip_month'
+       : rewardType
+         ? 'member_reward'
+         : code.trim() ? 'coupon' : 'none'
+ 
++    // 打开了「改用其他优惠」却什么都没选，等于让 VIP 会员按原价结账，这里先拦一道
++    if (vipActive && overrideVip && effectiveSource === 'none') {
++      setError('已打开「改用其他优惠」但还没选券或奖励。选一项，或点「恢复 VIP 85 折」')
++      return
++    }
+     if (effectiveSource === 'coupon' && !preview) { setError('请先点击「验证」确认优惠码'); return }
+     if (effectiveSource === 'member_reward' && !memberPreview) { setError('该会员奖励当前不可用'); return }
+     setError('')
+@@ -630,12 +638,25 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
+       {member && (
+         <div className="mb-4">
+           <label className="block text-xs text-stone-400 mb-1">会员优惠</label>
+-          {vipActive ? (
++          {vipActive && (
+             <div className="rounded-xl border border-terracotta/30 bg-terracotta/5 px-3 py-2 text-sm text-stone-700">
+-              VIP Month 生效中{member.vip_expires_on ? `（至 ${member.vip_expires_on}）` : ''}，系统自动使用 85 折，
+-              其他会员奖励暂时不可用。
++              <p>
++                VIP 月卡生效中{member.vip_expires_on ? `（至 ${member.vip_expires_on}）` : ''}，本单默认按 85 折结算。
++              </p>
++              <button
++                onClick={() => { setOverrideVip(v => !v); setRewardType(null); setCode(''); setPreview(null); setError('') }}
++                className="mt-2 px-3 py-1 rounded-xl border border-terracotta/40 bg-white text-xs font-medium text-terracotta hover:bg-terracotta/5"
++              >
++                {overrideVip ? '恢复 VIP 85 折' : '改用其他优惠'}
++              </button>
++              {overrideVip && (
++                <p className="mt-2 text-xs text-amber-700">
++                  本单不使用 VIP 折扣：下面选中的券或奖励会替代它，VIP 剩余天数不顺延。
++                </p>
++              )}
+             </div>
+-          ) : (
++          )}
++          {(!vipActive || overrideVip) && (
+             <div className="flex flex-wrap gap-2">
+               <button
+                 onClick={() => { setRewardType(null); setError('') }}
+@@ -658,7 +679,7 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
+               ))}
+             </div>
+           )}
+-          {!vipActive && member.usable_reward_types.length === 0 && (
++          {(!vipActive || overrideVip) && member.usable_reward_types.length === 0 && (
+             <p className="mt-1 text-xs text-stone-400">该会员当前没有可用的奖励。</p>
+           )}
+           <p className="mt-1 text-xs text-stone-400">同类多张时系统自动核销最早解锁的一张；刚解锁的奖励要下一次消费才能用。</p>
+@@ -672,14 +693,14 @@ function SettlementPanel({ session, member, onSettled }: { session: TimerSession
+           <input
+             className={inputCls + ' font-mono'}
+             placeholder="TDXXXXXXXX"
+-            disabled={vipActive || rewardType !== null}
++            disabled={vipDefault || rewardType !== null}
+             value={code}
+             onChange={e => { setCode(e.target.value.toUpperCase()); setPreview(null); setError('') }}
+             onKeyDown={e => e.key === 'Enter' && handleVerify()}
+           />
+           <button
+             onClick={handleVerify}
+-            disabled={verifying || !code.trim() || vipActive || rewardType !== null}
++            disabled={verifying || !code.trim() || vipDefault || rewardType !== null}
+             className="px-4 py-2 rounded-xl bg-stone-800 text-white text-sm font-medium hover:bg-stone-700 disabled:opacity-50 transition shrink-0"
+           >
+             {verifying ? '验证中…' : '验证'}
+diff --git a/app/(site)/booking/page.tsx b/app/(site)/booking/page.tsx
+index 9fd2bfd..9d111ec 100644
+--- a/app/(site)/booking/page.tsx
++++ b/app/(site)/booking/page.tsx
+@@ -208,7 +208,7 @@ export default function BookingPage() {
+           durationMinutes: selectedOption.durationMinutes,
+           customerName: form.name, email: form.email,
+           remark: form.remark || undefined,
+-          joinClub: form.joinClub,
++          joinClub: lang === 'zh' && form.joinClub,
+           lang,
+         }),
+       })
+@@ -637,18 +637,21 @@ export default function BookingPage() {
+                     {formErrors.email && <p className="mt-1 text-xs text-red-500">{formErrors.email}</p>}
+                   </div>
+ 
+-                  <label className="flex items-start gap-3 rounded-2xl border border-sand-200 bg-warm-50 p-4">
+-                    <input
+-                      type="checkbox"
+-                      className="mt-1"
+-                      checked={form.joinClub}
+-                      onChange={e => setForm({ ...form, joinClub: e.target.checked })}
+-                    />
+-                    <span>
+-                      <span className="block text-sm font-medium text-charcoal">{p(t.step4JoinClub)}</span>
+-                      <span className="mt-1 block text-xs leading-5 text-charcoal-light">{p(t.step4JoinClubHint)}</span>
+-                    </span>
+-                  </label>
++                  {/* 英文版暂不开放会员制度（业主 2026-09-17）：中文界面才给这个勾选框 */}
++                  {lang === 'zh' && (
++                    <label className="flex items-start gap-3 rounded-2xl border border-sand-200 bg-warm-50 p-4">
++                      <input
++                        type="checkbox"
++                        className="mt-1"
++                        checked={form.joinClub}
++                        onChange={e => setForm({ ...form, joinClub: e.target.checked })}
++                      />
++                      <span>
++                        <span className="block text-sm font-medium text-charcoal">{p(t.step4JoinClub)}</span>
++                        <span className="mt-1 block text-xs leading-5 text-charcoal-light">{p(t.step4JoinClubHint)}</span>
++                      </span>
++                    </label>
++                  )}
+ 
+                   <div>
+                     <label className="label" htmlFor="remark">{p(t.step4RemarkLabel)}</label>
+diff --git a/app/(site)/self-timer/club/page.tsx b/app/(site)/self-timer/club/page.tsx
+index a35ff63..7eee46b 100644
+--- a/app/(site)/self-timer/club/page.tsx
++++ b/app/(site)/self-timer/club/page.tsx
+@@ -1,25 +1,25 @@
+ 'use client'
+ 
+-// 会员首页（PRD 12、13、14）：同页展示进度、奖励、到店记录与奖励历史，不拆成二级入口。
++// 会员首页（PRD 12、13、14）：同页展示进度、奖励、到店记录，不拆成二级入口。
++// 2026-09-16：原「我的奖励」与「奖励记录」是同一份数据的两个视图（后者是前者的超集），合并成一块。
+ 
+ import { useCallback, useEffect, useState } from 'react'
+ import { useRouter } from 'next/navigation'
+-import { ArrowLeft, CalendarCheck, Crown, Gift, History, Sparkles } from 'lucide-react'
++import { ArrowLeft, CalendarCheck, Crown, Gift, Sparkles } from 'lucide-react'
+ import { useLanguage } from '@/lib/i18n/LanguageContext'
+ import MemberProgressBar from '@/components/member/MemberProgressBar'
+ import { forgetMember, readRememberedMember } from '@/lib/member/client'
+ import type { MemberDashboard, MemberRewardEntry, MemberVisitEntry } from '@/lib/member/service'
+-import type { RewardType } from '@/lib/member/member'
++import { londonDateOf, vipRewardState, type RewardType } from '@/lib/member/member'
+ 
+ const copy = {
+   zh: {
+-    title:        'Tangdouren Club',
++    title:        '糖豆人会员页',
+     hi:           (name: string) => `你好，${name}`,
+     loading:      '正在读取会员信息…',
+     startAsMember:'以会员身份开始计时',
+     myRewards:    '我的奖励',
+     recentVisits: '最近到店',
+-    rewardHistory:'奖励记录',
+     viewAll:      '查看全部',
+     collapse:     '收起',
+     noRewards:    '还没有解锁奖励，计满 2 次就能拿到第一张 £2 抵用券。',
+@@ -27,42 +27,45 @@ const copy = {
+     notMember:    '这台设备上没有记住会员身份。',
+     backToTimer:  '回到首页',
+     switchAccount:'切换账户',
+-    vipActive:    (date: string) => `VIP Month 生效中，有效期至 ${date}`,
+-    vipReady:     (n: number) => `你有 ${n} 张未激活的 VIP Month`,
+-    vipHint:      '激活后 30 天内每次计时自动享受 85 折，期间其他奖励暂时不可用但不会过期。',
++    vipActive:    (date: string) => `VIP 月卡生效中，有效期至 ${date}`,
++    vipReady:     (n: number) => `你有 ${n} 张未激活的 VIP 月卡`,
++    vipHint:      '激活后 30 天内每次计时自动享受 85 折。',
+     vipActivate:  '立即激活',
+     vipActivating:'激活中…',
+     vipActivated: '已激活',
+-    vipNone:      '累计 10 次到店解锁 VIP Month',
++    vipNone:      '累计 10 次到店解锁 VIP 月卡',
+     rewardNames: {
+       TWO_POUND:       '£2 抵用券',
+       FIVE_POUND:      '£5 抵用券',
+       PERSONAL_15_OFF: '本人 85 折',
+       FRIEND_10_OFF:   '朋友 9 折',
+-      VIP_MONTH:       'VIP Month',
++      VIP_MONTH:       'VIP 月卡',
+     } as Record<RewardType, string>,
+     states: {
+       available:      '可用',
+       used:           '已使用',
+-      paused_by_vip:  'VIP 结束后可用',
++      paused_by_vip:  'VIP 月卡生效中，暂不自行使用',
+       transferred:    '已转赠给朋友',
+     },
+     progressCounted: '计入进度',
+-    progressPaused:  'VIP 期间，进度暂停',
++    progressPaused:  '未计入进度',
+     usedReward:      (name: string) => `使用了${name}`,
+-    usedVip:         '使用 VIP 85 折',
++    usedVip:         '使用 VIP 月卡 85 折',
+     noRewardUsed:    '未使用会员优惠',
+     unlockedOn:      (d: string) => `${d} 解锁`,
+     usedOn:          (d: string) => `${d} 使用`,
++    activatedOn:     (d: string) => `${d} 激活`,
++    vipStateReady:   '未激活',
++    vipStateActive:  (d: string) => `生效中 · 至 ${d}`,
++    vipStateEnded:   '已结束',
+   },
+   en: {
+-    title:        'Tangdouren Club',
++    title:        'Tangdouren Membership',
+     hi:           (name: string) => `Hi ${name}`,
+     loading:      'Loading your membership…',
+     startAsMember:'Start as Member',
+     myRewards:    'My Rewards',
+     recentVisits: 'Recent Visits',
+-    rewardHistory:'Reward History',
+     viewAll:      'View all',
+     collapse:     'Show less',
+     noRewards:    'No rewards yet — two visits unlock your first £2 voucher.',
+@@ -72,7 +75,7 @@ const copy = {
+     switchAccount:'Use another account',
+     vipActive:    (date: string) => `VIP Month active until ${date}`,
+     vipReady:     (n: number) => `You have ${n} VIP Month ready to activate`,
+-    vipHint:      'Activate it and every timer session is 15% off for 30 days. Other rewards stay available after it ends.',
++    vipHint:      'Activate it and every timer session is 15% off for 30 days. Visit progress keeps counting as usual.',
+     vipActivate:  'Activate now',
+     vipActivating:'Activating…',
+     vipActivated: 'Activated',
+@@ -87,16 +90,20 @@ const copy = {
+     states: {
+       available:      'Available',
+       used:           'Used',
+-      paused_by_vip:  'Available after VIP Month',
++      paused_by_vip:  'Not self-usable during VIP Month',
+       transferred:    'Given to a friend',
+     },
+     progressCounted: 'Counted',
+-    progressPaused:  'Progress paused during VIP',
++    progressPaused:  'Not counted',
+     usedReward:      (name: string) => `Used ${name}`,
+     usedVip:         'Used VIP 15% off',
+     noRewardUsed:    'No member discount',
+     unlockedOn:      (d: string) => `Unlocked ${d}`,
+     usedOn:          (d: string) => `Used ${d}`,
++    activatedOn:     (d: string) => `Activated ${d}`,
++    vipStateReady:   'Not activated',
++    vipStateActive:  (d: string) => `Active until ${d}`,
++    vipStateEnded:   'Ended',
+   },
+ } as const
+ 
+@@ -106,7 +113,7 @@ function dateOf(iso: string | null): string {
+ 
+ export default function ClubPage() {
+   const router = useRouter()
+-  const { lang } = useLanguage()
++  const { lang, toggle } = useLanguage()
+   const c = copy[lang]
+ 
+   const [dashboard, setDashboard] = useState<MemberDashboard | null>(null)
+@@ -114,7 +121,7 @@ export default function ClubPage() {
+   const [error, setError]         = useState('')
+   const [activating, setActivating] = useState('')
+   const [showAllVisits, setShowAllVisits] = useState(false)
+-  const [showAllHistory, setShowAllHistory] = useState(false)
++  const [showAllRewards, setShowAllRewards] = useState(false)
+ 
+   const load = useCallback(async () => {
+     const remembered = readRememberedMember()
+@@ -163,10 +170,50 @@ export default function ClubPage() {
+   }
+ 
+   const memberName  = dashboard?.member.display_name ?? ''
++  const londonToday = londonDateOf(new Date())
+   const readyVip    = (dashboard?.rewards ?? []).filter(r => r.reward.reward_type === 'VIP_MONTH' && !r.benefit?.activated_on)
++
++  /**
++   * 奖励行右侧的状态。VIP 月卡这类奖励不能照搬券的状态（「生效中，暂不自行使用」是说给券听的），
++   * 它自己的状态由权益日期派生：未激活 / 生效中至 X / 已结束。
++   */
++  const rewardBadge = (entry: MemberRewardEntry): { text: string; tone: string } => {
++    if (entry.reward.reward_type === 'VIP_MONTH') {
++      const state = vipRewardState(entry.benefit, londonToday)
++      if (state === 'active') return { text: c.vipStateActive(entry.benefit?.expires_on ?? ''), tone: 'text-sage' }
++      if (state === 'ended')  return { text: c.vipStateEnded,  tone: 'text-charcoal-light' }
++      if (state === 'ready')  return { text: c.vipStateReady,  tone: 'text-sage' }
++    }
++    return {
++      text: c.states[entry.state],
++      tone: entry.state === 'available' ? 'text-sage' : 'text-charcoal-light',
++    }
++  }
+   const visitRows   = dashboard?.visit_history ?? []
+   const rewardRows  = dashboard?.rewards ?? []
+ 
++  // 英文版暂不开放会员制度（业主 2026-09-17）：英文界面只给一句提示与切回中文的按钮。
++  // 会员页本身是中文优先的页面，数据与接口都没变，中文界面照旧。
++  if (lang !== 'zh') {
++    return (
++      <div className="min-h-screen bg-gradient-to-br from-cream-100 via-orange-50 to-rose-50 px-4 pb-24 pt-24">
++        <div className="mx-auto max-w-md space-y-4">
++          <div className="card space-y-4 p-6 text-center">
++            <h1 className="font-display text-xl font-semibold text-charcoal">Tangdouren Membership</h1>
++            <p className="text-sm leading-6 text-charcoal-light">
++              The membership programme is currently available in Chinese only. Switch the site to
++              Chinese to join or view your rewards.
++            </p>
++            <button className="btn-primary w-full" onClick={toggle}>Switch to Chinese</button>
++            <button className="btn-ghost w-full text-sm" onClick={() => router.push('/self-timer')}>
++              Back to home
++            </button>
++          </div>
++        </div>
++      </div>
++    )
++  }
++
+   return (
+     <div className="min-h-screen bg-gradient-to-br from-cream-100 via-orange-50 to-rose-50 px-4 pb-24 pt-24">
+       <div className="mx-auto max-w-md space-y-4">
+@@ -201,6 +248,7 @@ export default function ClubPage() {
+               nextReward={dashboard.next_reward}
+               lifetimeVisits={dashboard.lifetime_visits}
+               lang={lang}
++              expandable
+             />
+ 
+             <button className="btn-primary w-full py-3.5 text-base" onClick={() => router.push('/self-timer')}>
+@@ -211,7 +259,7 @@ export default function ClubPage() {
+             <div className="card space-y-3 p-5">
+               <div className="flex items-center gap-2">
+                 <Crown size={16} className="text-terracotta" />
+-                <h2 className="font-display text-lg font-semibold text-charcoal">VIP Month</h2>
++                <h2 className="font-display text-lg font-semibold text-charcoal">{c.rewardNames.VIP_MONTH}</h2>
+               </div>
+               {dashboard.vip.active_expires_on
+                 ? <p className="text-sm text-charcoal">{c.vipActive(dashboard.vip.active_expires_on)}</p>
+@@ -232,7 +280,7 @@ export default function ClubPage() {
+                   : <p className="text-sm text-charcoal-light">{c.vipNone}</p>}
+             </div>
+ 
+-            {/* ── My Rewards（PRD 13.1）────────────────────────────────── */}
++            {/* ── My Rewards（PRD 13.1；2026-09-16 把原 13.2「奖励记录」合并进来）── */}
+             <div className="card space-y-3 p-5">
+               <div className="flex items-center gap-2">
+                 <Gift size={16} className="text-terracotta" />
+@@ -240,15 +288,28 @@ export default function ClubPage() {
+               </div>
+               {rewardRows.length === 0 && <p className="text-sm text-charcoal-light">{c.noRewards}</p>}
+               <ul className="space-y-2">
+-                {rewardRows.map(entry => (
+-                  <li key={entry.reward.reward_id} className="flex items-center justify-between gap-3 rounded-2xl border border-sand-100 bg-white px-3 py-2">
+-                    <span className="text-sm text-charcoal">{c.rewardNames[entry.reward.reward_type]}</span>
+-                    <span className={`text-xs ${entry.state === 'available' ? 'text-sage' : 'text-charcoal-light'}`}>
+-                      {c.states[entry.state]}
+-                    </span>
+-                  </li>
+-                ))}
++                {(showAllRewards ? rewardRows : rewardRows.slice(0, 5)).map((entry: MemberRewardEntry) => {
++                  const badge = rewardBadge(entry)
++                  return (
++                    <li key={entry.reward.reward_id} className="rounded-2xl border border-sand-100 bg-white px-3 py-2">
++                      <div className="flex items-center justify-between gap-3">
++                        <span className="text-sm text-charcoal">{c.rewardNames[entry.reward.reward_type]}</span>
++                        <span className={`text-xs ${badge.tone}`}>{badge.text}</span>
++                      </div>
++                      <p className="mt-0.5 text-xs text-charcoal-light">
++                        {c.unlockedOn(dateOf(entry.reward.unlocked_at))}
++                        {entry.reward.used_at && ` · ${c.usedOn(dateOf(entry.reward.used_at))}`}
++                        {entry.reward.reward_type === 'VIP_MONTH' && entry.benefit?.activated_on && ` · ${c.activatedOn(entry.benefit.activated_on)}`}
++                      </p>
++                    </li>
++                  )
++                })}
+               </ul>
++              {rewardRows.length > 5 && (
++                <button className="btn-ghost w-full text-sm" onClick={() => setShowAllRewards(v => !v)}>
++                  {showAllRewards ? c.collapse : c.viewAll}
++                </button>
++              )}
+             </div>
+ 
+             {/* ── Recent Visits（PRD 14）──────────────────────────────── */}
+@@ -284,33 +345,6 @@ export default function ClubPage() {
+               )}
+             </div>
+ 
+-            {/* ── Reward History（PRD 13.2）────────────────────────────── */}
+-            <div className="card space-y-3 p-5">
+-              <div className="flex items-center gap-2">
+-                <History size={16} className="text-terracotta" />
+-                <h2 className="font-display text-lg font-semibold text-charcoal">{c.rewardHistory}</h2>
+-              </div>
+-              <ul className="space-y-2">
+-                {(showAllHistory ? rewardRows : rewardRows.slice(0, 5)).map((entry: MemberRewardEntry) => (
+-                  <li key={entry.reward.reward_id} className="rounded-2xl border border-sand-100 bg-white px-3 py-2">
+-                    <div className="flex items-center justify-between">
+-                      <span className="text-sm text-charcoal">{c.rewardNames[entry.reward.reward_type]}</span>
+-                      <span className="text-xs text-charcoal-light">{c.states[entry.state]}</span>
+-                    </div>
+-                    <p className="mt-0.5 text-xs text-charcoal-light">
+-                      {c.unlockedOn(dateOf(entry.reward.unlocked_at))}
+-                      {entry.reward.used_at && ` · ${c.usedOn(dateOf(entry.reward.used_at))}`}
+-                      {entry.benefit?.activated_on && ` · ${c.vipActive(entry.benefit.expires_on ?? '')}`}
+-                    </p>
+-                  </li>
+-                ))}
+-              </ul>
+-              {rewardRows.length > 5 && (
+-                <button className="btn-ghost w-full text-sm" onClick={() => setShowAllHistory(v => !v)}>
+-                  {showAllHistory ? c.collapse : c.viewAll}
+-                </button>
+-              )}
+-            </div>
+           </>
+         )}
+ 
+diff --git a/app/(site)/self-timer/page.tsx b/app/(site)/self-timer/page.tsx
+index 7f00c2f..9f2a8f8 100644
+--- a/app/(site)/self-timer/page.tsx
++++ b/app/(site)/self-timer/page.tsx
+@@ -48,8 +48,8 @@ const copy = {
+     lookupNamePlaceholder: '开始计时时填写的名字',
+     lookupSubmit: '查询',
+     lookupNotFound: '未找到进行中的计时，请检查座位号与名字是否正确。',
+-    club: 'Tangdouren Club',
+-    clubIntro: '每次到店计时都会累积进度，满 2 次就有 £2 抵用券，满 10 次解锁 VIP Month。',
++    club: '糖豆人会员',
++    clubIntro: '每次到店计时都会累积进度，满 2 次就有 £2 抵用券，满 10 次解锁 VIP 月卡。',
+     clubWelcome: (name: string) => `欢迎回来，${name}`,
+     clubContinue: (name: string) => `继续以 ${name} 的身份`,
+     clubSwitch: '换一个账户',
+@@ -59,7 +59,7 @@ const copy = {
+     clubSigninTitle: '会员登录',
+     clubSigninHint: '输入注册时用的邮箱即可识别，不需要会员号。',
+     clubJoinTitle: '加入会员',
+-    clubConsent: '我同意 Tangdouren Club 会员条款',
++    clubConsent: '我同意糖豆人会员条款',
+     clubSubmitJoin: '加入会员',
+     clubSubmitSignin: '继续',
+     clubSubmitting: '处理中…',
+@@ -101,19 +101,19 @@ const copy = {
+     lookupNamePlaceholder: 'The name you entered',
+     lookupSubmit: 'Find',
+     lookupNotFound: 'No active timer found. Please check the seat number and name.',
+-    club: 'Tangdouren Club',
++    club: 'Tangdouren Membership',
+     clubIntro: 'Every in-store visit builds your progress. Two visits unlock a £2 voucher, ten unlock a VIP Month.',
+     clubWelcome: (name: string) => `Welcome back, ${name}`,
+     clubContinue: (name: string) => `Continue as ${name}`,
+     clubSwitch: 'Use another account',
+     clubForget: 'Forget this account',
+     clubSignin: "I'm a Member",
+-    clubJoin: 'Join the Club',
++    clubJoin: 'Join Tangdouren Membership',
+     clubSigninTitle: 'Member sign in',
+     clubSigninHint: 'Enter the email you registered with. There is no membership number.',
+-    clubJoinTitle: 'Join the Club',
+-    clubConsent: 'I agree to the Tangdouren Club membership terms',
+-    clubSubmitJoin: 'Join Club',
++    clubJoinTitle: 'Join Tangdouren Membership',
++    clubConsent: 'I agree to the Tangdouren Membership terms',
++    clubSubmitJoin: 'Join Membership',
+     clubSubmitSignin: 'Continue',
+     clubSubmitting: 'Working…',
+     clubEmailLabel: 'Email',
+@@ -281,7 +281,10 @@ export default function SelfTimerPage() {
+             <button className="btn-primary w-full" onClick={() => setPhase('form')}>{c.start}</button>
+             <button className="btn-secondary w-full" onClick={() => setPhase('tutorial')}>{c.tutorial}</button>
+             <button className="btn-secondary w-full" onClick={() => { setError(''); setPhase('lookup') }}>{c.lookupTitle}</button>
+-            <button className="btn-secondary w-full" onClick={() => { setError(''); setClubEmail(''); setPhase('club') }}>{c.club}</button>
++            {/* 英文版暂不开放会员制度（业主 2026-09-17）：中文界面才显示会员入口 */}
++            {lang === 'zh' && (
++              <button className="btn-secondary w-full" onClick={() => { setError(''); setClubEmail(''); setPhase('club') }}>{c.club}</button>
++            )}
+             <p className="text-center text-xs text-stone-400">{c.contactStaff}</p>
+           </div>
+         )}
+@@ -345,8 +348,12 @@ export default function SelfTimerPage() {
+ 
+         {phase === 'form' && (
+           <div className="card p-5 space-y-4">
+-            <p className="rounded-2xl bg-stone-50 px-4 py-3 text-xs leading-5 text-stone-500">{c.guestOnly}</p>
+-            {member
++            {/* 这句是给中文会员制度做说明的，英文版不开放会员，就不出现 */}
++            {lang === 'zh' && (
++              <p className="rounded-2xl bg-stone-50 px-4 py-3 text-xs leading-5 text-stone-500">{c.guestOnly}</p>
++            )}
++            {/* 英文版不出现会员身份：既不显示「以会员身份开始」，也不带出设备上记住的会员 */}
++            {lang === 'zh' && (member
+               ? <p className="rounded-2xl bg-terracotta/5 border border-terracotta/20 px-4 py-3 text-xs leading-5 text-charcoal">{c.memberStarting(member.display_name ?? member.email)}</p>
+               : (
+                 <button
+@@ -356,7 +363,7 @@ export default function SelfTimerPage() {
+                 >
+                   {c.memberStartHint}
+                 </button>
+-              )}
++              ))}
+             <div>
+               <span className="label">{c.tableLabel}</span>
+               <div className="mt-2 flex flex-wrap gap-2">
+diff --git a/app/api/admin/timers/[id]/route.ts b/app/api/admin/timers/[id]/route.ts
+index 01be3e8..9e68aff 100644
+--- a/app/api/admin/timers/[id]/route.ts
++++ b/app/api/admin/timers/[id]/route.ts
+@@ -151,8 +151,10 @@ export async function PATCH(
+       ? await getMemberSettleInfo(admin, sponsorMemberId, londonDateOf(new Date()))
+       : null
+ 
+-    // 没显式指定来源时：本单会员有生效中的 VIP 就强制走 VIP（PRD 11.4），
++    // 没显式指定来源时：本单会员有生效中的 VIP 就默认走 VIP（PRD 11.4），
+     // 否则按有没有券码决定用券还是不用优惠。
++    // 前端显式传来源的情况里包含「VIP 期间店员手动改用券或奖励」（业主 2026-09-16 口径），
++    // 那条路径同样由数据库复核金额，最终以服务端算出来的为准。
+     const source: DiscountSource = body.discount_source
+       ?? (memberInfo?.vipActive && sponsorMemberId === sessionMemberId ? 'vip_month'
+         : body.coupon_code ? 'coupon'
+diff --git a/app/api/bookings/route.ts b/app/api/bookings/route.ts
+index c45632a..0b6081b 100644
+--- a/app/api/bookings/route.ts
++++ b/app/api/bookings/route.ts
+@@ -27,7 +27,7 @@ const BookingSchema = z.object({
+   email:           z.string().email('请输入有效的邮箱地址').max(100),
+   remark:          z.string().max(500).optional(),
+   lang:            z.enum(['zh', 'en']).optional().default('zh'),
+-  // 勾选「加入 Tangdouren Club」：随预约一起建会员，不等支付结果（PRD 2.3）
++  // 勾选「加入糖豆人会员」：随预约一起建会员，不等支付结果（PRD 2.3）
+   joinClub:        z.boolean().optional().default(false),
+ })
+ 
+@@ -46,9 +46,10 @@ export async function POST(request: NextRequest) {
+     const { joinClub, ...bookingInput } = parsed.data
+     const result   = await createBooking(bookingInput, supabase)
+ 
+-    // 勾选了加入会员就在这里建，失败也不连累预约本身
++    // 勾选了加入会员就在这里建，失败也不连累预约本身。
++    // 英文版暂不开放会员制度（业主 2026-09-17）：英文提交即使带上 joinClub 也不建会员。
+     let memberJoined = false
+-    if (joinClub) {
++    if (joinClub && parsed.data.lang === 'zh') {
+       try {
+         const { member } = await ensureMember(supabase, {
+           email:         parsed.data.email,
+@@ -91,6 +92,7 @@ export async function POST(request: NextRequest) {
+         studioAddress: 'Unit 226, 65-75 Whitechapel Road, London E1 1DU',
+         studioEmail:   process.env.NEXT_PUBLIC_STUDIO_EMAIL ?? 'hello@tangdouren.co.uk',
+         lang:          parsed.data.lang,
++        memberJoined,
+       })
+       const emailResult = await sendEmail({ to: parsed.data.email, subject, html })
+       if (!emailResult.ok) {
+diff --git a/components/member/MemberProgressBar.tsx b/components/member/MemberProgressBar.tsx
+index b89d75f..8929cdf 100644
+--- a/components/member/MemberProgressBar.tsx
++++ b/components/member/MemberProgressBar.tsx
+@@ -2,7 +2,10 @@
+ 
+ // 会员进度条（PRD 7.1）：十格循环显示，2 / 5 / 8 / 10 是奖励节点。
+ // 顾客端不出现「第几轮」这类概念，只显示本轮的第几格。
++// 奖励说明：每个奖励节点都带 title（电脑上鼠标悬停可见）；
++// expandable = true 时再支持「点一下展开」（顾客端多是手机，没有悬停这回事）。
+ 
++import { useState } from 'react'
+ import { Star } from 'lucide-react'
+ import type { Lang } from '@/lib/i18n/translations'
+ import type { NextReward, ProgressCell, RewardType } from '@/lib/member/member'
+@@ -14,12 +17,20 @@ const copy = {
+     toNext:        (n: number) => `再 ${n} 次解锁下一个奖励`,
+     nextIs:        '下一个奖励',
+     roundDone:     '本轮已完成，下一格自动开始新一轮',
++    atNode:        (n: number) => `第 ${n} 次`,
+     rewards: {
+       TWO_POUND:       '£2',
+       FIVE_POUND:      '£5',
+       PERSONAL_15_OFF: '🎁',
+       FRIEND_10_OFF:   '🎁',
+-      VIP_MONTH:       'VIP',
++      VIP_MONTH:       '月卡',
++    } as Record<RewardType, string>,
++    hints: {
++      TWO_POUND:       '£2 抵用券：下次到店结算时可抵扣 £2',
++      FIVE_POUND:      '£5 抵用券：下次到店结算时可抵扣 £5',
++      PERSONAL_15_OFF: '本人 85 折：下次消费可以自己用',
++      FRIEND_10_OFF:   '朋友 9 折：可以给朋友用',
++      VIP_MONTH:       'VIP 月卡：激活后 30 天内每次计时自动享受 85 折',
+     } as Record<RewardType, string>,
+   },
+   en: {
+@@ -27,7 +38,8 @@ const copy = {
+     lifetime:      (n: number) => `Lifetime visits: ${n}`,
+     toNext:        (n: number) => `${n} more ${n === 1 ? 'visit' : 'visits'} to your next reward`,
+     nextIs:        'Next reward',
+-    roundDone:     'This round is complete — the next visit starts a new round',
++    roundDone:     'This round is complete, the next visit starts a new round',
++    atNode:        (n: number) => `Visit ${n}`,
+     rewards: {
+       TWO_POUND:       '£2',
+       FIVE_POUND:      '£5',
+@@ -35,6 +47,13 @@ const copy = {
+       FRIEND_10_OFF:   '🎁',
+       VIP_MONTH:       'VIP',
+     } as Record<RewardType, string>,
++    hints: {
++      TWO_POUND:       '£2 voucher: £2 off at your next settlement',
++      FIVE_POUND:      '£5 voucher: £5 off at your next settlement',
++      PERSONAL_15_OFF: '15% off for you: use it on your next visit',
++      FRIEND_10_OFF:   '10% off for a friend: pass it on',
++      VIP_MONTH:       'VIP Month: 15% off every timer session for 30 days after you activate it',
++    } as Record<RewardType, string>,
+   },
+ } as const
+ 
+@@ -44,42 +63,63 @@ interface Props {
+   nextReward:     NextReward | null
+   lifetimeVisits: number
+   lang:           Lang
++  /** 顾客端传 true：奖励节点可以点一下展开说明（手机没有悬停） */
++  expandable?:    boolean
+ }
+ 
+-export default function MemberProgressBar({ cells, cycleProgress, nextReward, lifetimeVisits, lang }: Props) {
++export default function MemberProgressBar({ cells, cycleProgress, nextReward, lifetimeVisits, lang, expandable = false }: Props) {
+   const c = copy[lang]
++  const [openNode, setOpenNode] = useState<number | null>(null)
++
++  /** 一个节点上可能挂着两种奖励（第 8 次是本人 85 折 + 朋友 9 折），说明合并显示 */
++  const nodeHint = (types: readonly RewardType[]) =>
++    types.map(rt => c.hints[rt]).filter((v, i, a) => a.indexOf(v) === i).join(' · ')
++
++  const openCell = cells.find(cell => cell.index === openNode && cell.isRewardNode) ?? null
+ 
+   return (
+     <div className="rounded-3xl border border-sand-200 bg-white p-5 shadow-sm">
+       <p className="text-sm font-semibold text-charcoal">{c.visits(cycleProgress, cells.length)}</p>
+ 
+       <div className="mt-4 flex items-center gap-1">
+-        {cells.map((cell, index) => (
+-          <div key={cell.index} className="flex flex-1 items-center">
+-            <div className="flex flex-1 flex-col items-center gap-1">
+-              <span
+-                aria-hidden
+-                className={
+-                  cell.state === 'done'
+-                    ? 'flex h-6 w-6 items-center justify-center rounded-full bg-terracotta text-white'
+-                    : cell.state === 'current'
+-                      ? 'flex h-6 w-6 items-center justify-center rounded-full border-2 border-terracotta bg-white'
+-                      : 'flex h-6 w-6 items-center justify-center rounded-full border border-sand-200 bg-white'
+-                }
+-              >
+-                {cell.isRewardNode
+-                  ? <Star size={12} className={cell.state === 'done' ? 'text-white' : 'text-terracotta'} />
+-                  : <span className={`h-1.5 w-1.5 rounded-full ${cell.state === 'done' ? 'bg-white' : 'bg-sand-200'}`} />}
+-              </span>
+-              <span className="h-4 text-[10px] leading-4 text-charcoal-light">
+-                {cell.isRewardNode ? cell.rewardTypes.map(rt => c.rewards[rt]).filter((v, i, a) => a.indexOf(v) === i).join('/') : ''}
+-              </span>
++        {cells.map((cell, index) => {
++          const hint = cell.isRewardNode ? nodeHint(cell.rewardTypes) : undefined
++          const circle = cell.state === 'done'
++            ? 'flex h-6 w-6 items-center justify-center rounded-full bg-terracotta text-white'
++            : cell.state === 'current'
++              ? 'flex h-6 w-6 items-center justify-center rounded-full border-2 border-terracotta bg-white'
++              : 'flex h-6 w-6 items-center justify-center rounded-full border border-sand-200 bg-white'
++          return (
++            <div key={cell.index} className="flex flex-1 items-center">
++              <div className="flex flex-1 flex-col items-center gap-1">
++                {cell.isRewardNode && expandable ? (
++                  <button
++                    type="button"
++                    title={hint}
++                    aria-label={hint}
++                    aria-expanded={openNode === cell.index}
++                    onClick={() => setOpenNode(v => (v === cell.index ? null : cell.index))}
++                    className={circle}
++                  >
++                    <Star size={12} className={cell.state === 'done' ? 'text-white' : 'text-terracotta'} />
++                  </button>
++                ) : (
++                  <span aria-hidden title={hint} className={circle}>
++                    {cell.isRewardNode
++                      ? <Star size={12} className={cell.state === 'done' ? 'text-white' : 'text-terracotta'} />
++                      : <span className={`h-1.5 w-1.5 rounded-full ${cell.state === 'done' ? 'bg-white' : 'bg-sand-200'}`} />}
++                  </span>
++                )}
++                <span className="h-4 text-[10px] leading-4 text-charcoal-light">
++                  {cell.isRewardNode ? cell.rewardTypes.map(rt => c.rewards[rt]).filter((v, i, a) => a.indexOf(v) === i).join('/') : ''}
++                </span>
++              </div>
++              {index < cells.length - 1 && (
++                <span aria-hidden className={`-mt-5 h-0.5 flex-1 ${cell.state === 'done' ? 'bg-terracotta' : 'bg-sand-200'}`} />
++              )}
+             </div>
+-            {index < cells.length - 1 && (
+-              <span aria-hidden className={`-mt-5 h-0.5 flex-1 ${cell.state === 'done' ? 'bg-terracotta' : 'bg-sand-200'}`} />
+-            )}
+-          </div>
+-        ))}
++          )
++        })}
+       </div>
+ 
+       <p className="mt-3 text-sm text-charcoal">
+@@ -87,6 +127,14 @@ export default function MemberProgressBar({ cells, cycleProgress, nextReward, li
+         {nextReward && <span className="ml-1 text-charcoal-light">({c.nextIs}: {nextReward.rewardTypes.map(rt => c.rewards[rt]).filter((v, i, a) => a.indexOf(v) === i).join('/')})</span>}
+       </p>
+       <p className="mt-1 text-xs text-charcoal-light">{c.lifetime(lifetimeVisits)}</p>
++
++      {expandable && openCell && (
++        <p className="mt-3 rounded-2xl bg-sand-50 px-3 py-2 text-xs leading-5 text-charcoal">
++          <span className="font-semibold">{c.atNode(openCell.index)}</span>
++          <span className="mx-1 text-charcoal-light">·</span>
++          {nodeHint(openCell.rewardTypes)}
++        </p>
++      )}
+     </div>
+   )
+ }
+diff --git a/docs/verify_member_system.sql b/docs/verify_member_system.sql
+index 48c342b..3c06b58 100644
+--- a/docs/verify_member_system.sql
++++ b/docs/verify_member_system.sql
+@@ -199,7 +199,8 @@ BEGIN
+   END;
+ 
+   ------------------------------------------------------------------
+-  -- 4. VIP 期间结算：自动 85 折、进度暂停、不能改用别的优惠
++  -- 4. VIP 期间结算：默认 85 折、进度照常累积、可手动改用其他优惠
++  --    （业主 2026-09-16 口径）
+   ------------------------------------------------------------------
+   INSERT INTO timer_sessions (
+     session_id, customer_name, status, started_at, is_settled,
+@@ -212,13 +213,13 @@ BEGIN
+ 
+   SELECT actual_amount_gbp INTO v_num FROM timer_sessions WHERE session_id = v_s;
+   INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+-    ('VIP 期间结算自动 85 折（13.99 → 11.89）', '11.89', v_num::text,
++    ('VIP 期间结算默认 85 折（13.99 → 11.89）', '11.89', v_num::text,
+      CASE WHEN v_num = 11.89 THEN 'PASS' ELSE 'FAIL' END);
+ 
+   SELECT reward_eligible INTO v_bool FROM timer_sessions WHERE session_id = v_s;
+   INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+-    ('VIP 期间的单不计入 Reward Progress', 'false', v_bool::text,
+-     CASE WHEN v_bool IS FALSE THEN 'PASS' ELSE 'FAIL' END);
++    ('VIP 期间的单照常计入 Reward Progress', 'true', v_bool::text,
++     CASE WHEN v_bool IS TRUE THEN 'PASS' ELSE 'FAIL' END);
+ 
+   SELECT count(*) INTO v_cnt FROM member_visit_days WHERE member_id = v_a;
+   INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+@@ -227,8 +228,8 @@ BEGIN
+ 
+   SELECT count(*) INTO v_cnt FROM member_visit_days WHERE member_id = v_a AND reward_eligible;
+   INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+-    ('VIP 期间 Reward Progress 停住（仍为 12）', '12', v_cnt::text,
+-     CASE WHEN v_cnt = 12 THEN 'PASS' ELSE 'FAIL' END);
++    ('VIP 期间 Reward Progress 照常加（12 → 13）', '13', v_cnt::text,
++     CASE WHEN v_cnt = 13 THEN 'PASS' ELSE 'FAIL' END);
+ 
+   INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled,
+     billing_minutes, amount_gbp, created_via, created_by, member_id)
+@@ -236,29 +237,48 @@ BEGIN
+           60, 13.99, 'self_service', 'hermes_test', v_a)
+   RETURNING session_id INTO v_s2;
+ 
++  -- 什么都不选：VIP 会员不该按原价结账，必须拦住
+   BEGIN
+-    PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, NULL, 200, 'member_reward', v_a, 'TWO_POUND');
++    PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, NULL, 0, 'none', NULL, NULL);
+     INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+-      ('VIP 期间不能改用会员奖励', 'VIP_MUST_BE_APPLIED', '居然结算成功', 'FAIL');
++      ('VIP 期间「不使用优惠」被拦', 'VIP_MUST_BE_APPLIED', '居然结算成功', 'FAIL');
+   EXCEPTION WHEN OTHERS THEN
+     INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+-      ('VIP 期间不能改用会员奖励', 'VIP_MUST_BE_APPLIED', SQLERRM,
++      ('VIP 期间「不使用优惠」被拦', 'VIP_MUST_BE_APPLIED', SQLERRM,
+        CASE WHEN SQLERRM LIKE '%VIP_MUST_BE_APPLIED%' THEN 'PASS' ELSE 'FAIL' END);
+   END;
+ 
++  -- 手动改用会员奖励：应当成功，当次放弃 VIP 折扣
++  BEGIN
++    PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, NULL, 200, 'member_reward', v_a, 'TWO_POUND');
++    SELECT actual_amount_gbp INTO v_num FROM timer_sessions WHERE session_id = v_s2;
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('VIP 期间可以改用会员奖励（13.99 → 11.99）', '11.99', v_num::text,
++       CASE WHEN v_num = 11.99 THEN 'PASS' ELSE 'FAIL' END);
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('VIP 期间可以改用会员奖励（13.99 → 11.99）', '11.99', SQLERRM, 'FAIL');
++  END;
++
++  PERFORM unsettle_timer_session(v_s2);   -- 撤销回来，供下一条复用
++
+   INSERT INTO coupons (code, discount_type, discount_value, created_by)
+   VALUES ('HTTEST0001', 'percentage_off', 10, 'hermes_test') RETURNING coupon_id INTO v_coupon;
+ 
++  -- 手动改用普通优惠券：同样应当成功
+   BEGIN
+     PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, 'HTTEST0001', 140, 'coupon', NULL, NULL);
++    SELECT actual_amount_gbp INTO v_num FROM timer_sessions WHERE session_id = v_s2;
+     INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+-      ('VIP 期间普通优惠券也走强制 VIP（我们补的解释）', 'VIP_MUST_BE_APPLIED', '居然结算成功', 'FAIL');
++      ('VIP 期间也可以改用普通优惠券（13.99 → 12.59）', '12.59', v_num::text,
++       CASE WHEN v_num = 12.59 THEN 'PASS' ELSE 'FAIL' END);
+   EXCEPTION WHEN OTHERS THEN
+     INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
+-      ('VIP 期间普通优惠券也走强制 VIP（我们补的解释）', 'VIP_MUST_BE_APPLIED', SQLERRM,
+-       CASE WHEN SQLERRM LIKE '%VIP_MUST_BE_APPLIED%' THEN 'PASS' ELSE 'FAIL' END);
++      ('VIP 期间也可以改用普通优惠券（13.99 → 12.59）', '12.59', SQLERRM, 'FAIL');
+   END;
+ 
++  PERFORM unsettle_timer_session(v_s2);   -- 再撤销回来
++
+   -- 让这张 VIP 过期，回到非 VIP 状态继续测别的
+   UPDATE member_benefits
+      SET activated_on = v_today - 40,
+diff --git a/docs/verify_via_api.py b/docs/verify_via_api.py
+index 623b449..1b8c03a 100644
+--- a/docs/verify_via_api.py
++++ b/docs/verify_via_api.py
+@@ -3,9 +3,9 @@
+ # 会员系统真实数据验证（走 PostgREST + service key，不需要额外 token）
+ #
+ # 覆盖：视图计数与同日去重、解锁档位与幂等、VIP 激活与日期边界、
+-#       VIP 期间进度暂停与强制折扣、£2 券核销与撤销回退、
++#       VIP 期间进度照常累积与「默认 VIP、可手动改用其他优惠」、£2 券核销与撤销回退、
+ #       朋友券用在他人的订单上、本人券不能给他人、刚解锁的奖励不能当次用、
+-#       撤销结算的守卫条件。
++#       撤销结算的守卫条件、后台补挂已结算订单的规矩。
+ #
+ # 会先清掉上次的测试数据（幂等可重跑），跑完保留数据供在界面上查看。
+ # ============================================================
+@@ -211,7 +211,7 @@ st, out = rpc("activate_member_vip", p_reward_id=orphan[0]["reward_id"], p_activ
+ check("奖励在但权益行缺失 → 报权益不存在", "MEMBER_BENEFIT_NOT_FOUND", err_of((st, out)))
+ wipe("member_rewards", f"reward_id=eq.{orphan[0]['reward_id']}", "清掉刚造的孤儿奖励")
+ 
+-# ── 5. VIP 期间结算：自动 85 折 + 进度暂停 ──────────────────────────────────
++# ── 5. VIP 期间结算：默认 85 折 + 进度照常累积 ──────────────────────────────
+ add_session("DEMO-VIP-1", A, 13.99, 0, settled=False)
+ st, out = rpc("settle_timer_session", p_session_id="DEMO-VIP-1", p_settled_by="hermes_test",
+               p_discount_amount_pence=210, p_discount_source="vip_month", p_member_id=A)
+@@ -219,24 +219,36 @@ check("VIP 期间结算成功", 200, st)
+ st, rows = sel("timer_sessions", "select=actual_amount_gbp,reward_eligible,discount_amount_gbp&session_id=eq.DEMO-VIP-1")
+ check("VIP 自动 85 折（13.99 → 11.89）", "11.89", rows[0]["actual_amount_gbp"])
+ check("折扣金额记为 £2.10", 2.10, round(float(rows[0]["discount_amount_gbp"]), 2))
+-check("VIP 期间的单不计入 Reward Progress", False, rows[0]["reward_eligible"])
++check("VIP 期间的单照常计入 Reward Progress（业主 2026-09-16 口径）", True, rows[0]["reward_eligible"])
+ st, rows = sel("member_visit_days", "select=reward_eligible&member_id=eq." + A)
+ check("VIP 期间 Lifetime 照常加（→13）", 13, len(rows))
+-check("VIP 期间 Reward Progress 停住（仍 12）", 12, sum(1 for r in rows if r["reward_eligible"]))
++check("VIP 期间 Reward Progress 照常加（→13）", 13, sum(1 for r in rows if r["reward_eligible"]))
+ 
+-# ── 6. VIP 期间不能改用别的优惠 ─────────────────────────────────────────────
++# ── 6. VIP 期间：不选优惠被拦，改用券或奖励放行（业主 2026-09-16 口径）──────
+ add_session("DEMO-VIP-2", A, 13.99, 0, settled=False)
++st, out = rpc("settle_timer_session", p_session_id="DEMO-VIP-2", p_settled_by="hermes_test",
++              p_discount_amount_pence=0, p_discount_source="none")
++check("VIP 期间「不使用优惠」被拦（会员不该按原价结账）", "VIP_MUST_BE_APPLIED", err_of((st, out)))
++
+ st, out = rpc("settle_timer_session", p_session_id="DEMO-VIP-2", p_settled_by="hermes_test",
+               p_discount_amount_pence=200, p_discount_source="member_reward",
+               p_member_id=A, p_reward_type="TWO_POUND")
+-check("VIP 期间不能改用会员奖励", "VIP_MUST_BE_APPLIED", err_of((st, out)))
++check("VIP 期间可以改用会员奖励（当次放弃 VIP 折扣）", 200, st)
++st, rows = sel("timer_sessions", "select=actual_amount_gbp&session_id=eq.DEMO-VIP-2")
++check("改用 £2 券后金额 13.99 → 11.99", "11.99", rows[0]["actual_amount_gbp"])
++st, out = rpc("unsettle_timer_session", p_session_id="DEMO-VIP-2")
++check("把这一单撤销回来，供下一步复用", 200, st)
+ 
+ st, cpn = req("POST", "/rest/v1/coupons", [{"code": "TDTEST0001", "code_prefix": "TD",
+               "discount_type": "percentage_off", "discount_value": 10, "created_by": "hermes_test"}],
+               prefer="return=representation")
+ st, out = rpc("settle_timer_session", p_session_id="DEMO-VIP-2", p_settled_by="hermes_test",
+               p_coupon_code="TDTEST0001", p_discount_amount_pence=140, p_discount_source="coupon")
+-check("VIP 期间普通优惠券也被强制 VIP（我们补的解释）", "VIP_MUST_BE_APPLIED", err_of((st, out)))
++check("VIP 期间也可以改用普通优惠券", 200, st)
++st, rows = sel("timer_sessions", "select=actual_amount_gbp&session_id=eq.DEMO-VIP-2")
++check("改用 10% 券后金额 13.99 → 12.59", "12.59", rows[0]["actual_amount_gbp"])
++st, out = rpc("unsettle_timer_session", p_session_id="DEMO-VIP-2")
++check("再撤销回来，回到未结算", 200, st)
+ 
+ # ── 7. 让 VIP 过期，回到非 VIP ─────────────────────────────────────────────
+ st, ben3 = sel("member_benefits", f"select=benefit_id&member_id=eq.{A}")
+@@ -312,16 +324,30 @@ check("第二笔用掉那张刚解锁的 £2", 200, st)
+ st, out = rpc("unsettle_timer_session", p_session_id="DEMO-B-002")
+ check("奖励已被后续使用则拒绝撤销来源结算", "REWARD_ALREADY_USED", err_of((st, out)))
+ 
+-# ── 11b. Link to Member：未结算可挂，已结算拒绝 ─────────────────────────────
++# ── 11b. Link to Member：未结算可挂；已结算的补挂只记到店次数 ───────────────
+ add_session("DEMO-LINK-1", None, 13.99, 5, settled=False)
+ st, out = rpc("link_timer_session_to_member", p_session_id="DEMO-LINK-1", p_member_id=B)
+ check("未结算的订单可以挂到会员", 200, st)
+-st, rows = sel("timer_sessions", "select=member_id&session_id=eq.DEMO-LINK-1")
++st, rows = sel("timer_sessions", "select=member_id,reward_eligible&session_id=eq.DEMO-LINK-1")
+ check("挂上去之后归属正确", B, rows[0]["member_id"])
++check("未结算的单挂上后进度资格仍是 NULL（等结算时判定）", None, rows[0]["reward_eligible"])
+ 
++st, vbefore = sel("member_visit_days", f"select=reward_eligible&member_id=eq.{B}")
+ add_session("DEMO-LINK-2", None, 13.99, 6)
+ st, out = rpc("link_timer_session_to_member", p_session_id="DEMO-LINK-2", p_member_id=B)
+-check("已结算的订单拒绝挂会员（我们定的口径）", "SESSION_ALREADY_SETTLED", err_of((st, out)))
++check("已结算的散客单允许补挂（业主 2026-09-16 口径）", 200, st)
++st, rows = sel("timer_sessions", "select=member_id,reward_eligible,actual_amount_gbp&session_id=eq.DEMO-LINK-2")
++check("补挂后归属正确", B, rows[0]["member_id"])
++check("补挂只记到店：reward_eligible = false", False, rows[0]["reward_eligible"])
++check("补挂不动已收金额", "13.99", rows[0]["actual_amount_gbp"])
++st, vafter = sel("member_visit_days", f"select=reward_eligible&member_id=eq.{B}")
++check("补挂让 Lifetime 加 1", len(vbefore or []) + 1, len(vafter or []))
++check("补挂不让进度加",
++      sum(1 for x in (vbefore or []) if x["reward_eligible"]),
++      sum(1 for x in (vafter or []) if x["reward_eligible"]))
++
++st, out = rpc("link_timer_session_to_member", p_session_id="DEMO-LINK-2", p_member_id=A)
++check("已结算且已归属的单不能再改到别的会员", "SESSION_ALREADY_LINKED", err_of((st, out)))
+ 
+ st, out = rpc("link_timer_session_to_member", p_session_id="DEMO-LINK-1", p_member_id="00000000-0000-0000-0000-000000000000")
+ check("挂到不存在的会员会被拒", "MEMBER_NOT_FOUND", err_of((st, out)))
+diff --git "a/docs/\344\270\212\347\272\277\350\277\201\347\247\273-\344\270\200\346\254\241\346\211\247\350\241\214.sql" "b/docs/\344\270\212\347\272\277\350\277\201\347\247\273-\344\270\200\346\254\241\346\211\247\350\241\214.sql"
+index 1508381..9ea0032 100644
+--- "a/docs/\344\270\212\347\272\277\350\277\201\347\247\273-\344\270\200\346\254\241\346\211\247\350\241\214.sql"
++++ "b/docs/\344\270\212\347\272\277\350\277\201\347\247\273-\344\270\200\346\254\241\346\211\247\350\241\214.sql"
+@@ -8,7 +8,7 @@
+ --
+ -- 本文件 = supabase/migrations/016_members.sql + 017_member_settlement.sql
+ -- 顺序不能反：017 依赖 016 建的表和列。两个文件都是可重复执行的。
+--- 执行完可用 docs/verify_via_api.py 复验（52 项）。
++-- 执行完可用 docs/verify_via_api.py 复验（64 项）。
+ -- ============================================================================
+ 
+ -- ┌──────────────────────────────────────────────────────────────────────────┐
+@@ -142,6 +142,10 @@ CREATE INDEX IF NOT EXISTS idx_bookings_email_key    ON bookings(lower(btrim(ema
+ --   3) 折扣来源是单选枚举（none / coupon / member_reward / vip_month），从结构上排除叠加（PRD 21）。
+ --   4) 金额仍由 TypeScript 先算（lib/coupon/coupon.ts），SQL 用自己查到的券或奖励记录复核，
+ --      对不上抛错。**改动折扣逻辑必须同时改这两处**，否则会出现预览金额与最终结算不一致。
++--   5) 业主 2026-09-16 口径修正（与 PRD 6.2 / 11.4 不一致，PRD 待 v1.1 更新）：
++--      ① VIP 生效期间折扣默认走 VIP，店员可在结算台手动改用券或会员奖励，当次放弃 VIP 折扣；
++--      ② VIP 期间进度照常累积，不再暂停。
++--   6) 已结算的散客单允许在后台账补挂到会员名下，只记到店次数，不追折扣、不补发奖励。
+ -- ============================================================
+ 
+ -- ── 1. member_rewards ────────────────────────────────────────────────────────
+@@ -472,12 +476,15 @@ BEGIN
+     RAISE EXCEPTION 'MULTIPLE_DISCOUNT_SOURCES' USING ERRCODE = 'P0001';
+   END IF;
+ 
+-  -- 3. VIP 生效期间强制走 VIP 折扣（PRD 11.4 / 21）。
+-  --    这里故意抛错而不是静默改写：TypeScript 侧的预览必须同步改，否则预览金额与最终结算会不一致。
++  -- 3. VIP 生效期间默认走 VIP 折扣（PRD 11.4 / 21 + 业主 2026-09-16 口径）。
++  --    默认 = vip_month；但店员可以在柜台手动改用券或会员奖励，当次放弃 VIP 折扣，
++  --    VIP 的 30 天不会因此顺延。折扣类型与数值照样落在快照列里，报表可查。
++  --    这里只拦「不打折」：VIP 会员按原价结账只会是漏选，不是业务意图。
++  --    故意抛错而不是静默改写：TypeScript 侧的预览必须同步改，否则预览金额与最终结算会不一致。
+   IF v_session.member_id IS NOT NULL THEN
+     v_vip_active := member_vip_active(v_session.member_id);
+   END IF;
+-  IF v_vip_active AND v_source <> 'vip_month' THEN
++  IF v_vip_active AND v_source = 'none' THEN
+     RAISE EXCEPTION 'VIP_MUST_BE_APPLIED' USING ERRCODE = 'P0001';
+   END IF;
+ 
+@@ -598,11 +605,14 @@ BEGIN
+   END IF;
+ 
+   -- 5. 固化本次消费是否计入 Reward Progress（PRD 19.2）。
+-  --    散客单不判定，留 NULL；会员单在结算这一刻看有没有生效中的 VIP。
++  --    散客单不判定，留 NULL；会员单一律计入。
++  --    业主 2026-09-16 口径：VIP 期间进度照常累积，不再按「有没有生效中的 VIP」暂停。
++  --    所以 false 现在只有一个来源：后台把已结算的散客单补挂到会员名下（见第 7 节），
++  --    那一单只算 Lifetime Visits、不走进度。
+   IF v_session.member_id IS NULL THEN
+     v_reward_eligible := NULL;
+   ELSE
+-    v_reward_eligible := NOT v_vip_active;
++    v_reward_eligible := TRUE;
+   END IF;
+ 
+   -- 会员券类奖励的内部券码，仅作快照留痕，顾客端不展示
+@@ -813,8 +823,11 @@ $$;
+ -- ── 7. 后台动作：把订单关联到会员、激活 VIP Month ────────────────────────────
+ 
+ -- 顾客以散客身份开始计时后才想起自己是会员时，店员在后台把订单挂到会员名下（PRD 5.2）。
+--- 只允许挂「尚未结算」的单：进度必须来自真实结算记录，已结算的单要先撤销结算再挂，
+--- 否则等于绕过结算台账手动改数字（PRD 16.3、18）。
++-- 业主 2026-09-16 口径：已结算的单也允许补挂，但只补「这一单是他来的」，
++-- 不追折扣、不补发奖励、不动已收金额，所以这一单写 reward_eligible = false，
++-- 只进 Lifetime Visits、不进 Reward Progress。
++-- 守两条线：① 已归属到别的会员的单不再改归属，否则等于把一次到店从甲挪到乙；
++--           ② 未结算的单挂上后 reward_eligible 留 NULL，等结算时按会员单判定。
+ CREATE OR REPLACE FUNCTION public.link_timer_session_to_member(
+   p_session_id text,
+   p_member_id  uuid
+@@ -834,13 +847,17 @@ BEGIN
+   IF NOT FOUND THEN
+     RAISE EXCEPTION 'SESSION_NOT_FOUND' USING ERRCODE = 'P0001';
+   END IF;
+-  IF v_session.is_settled THEN
+-    RAISE EXCEPTION 'SESSION_ALREADY_SETTLED' USING ERRCODE = 'P0001';
++  -- 已结算的单只允许「补挂」，不允许改归属
++  IF v_session.is_settled
++     AND v_session.member_id IS NOT NULL
++     AND v_session.member_id IS DISTINCT FROM p_member_id THEN
++    RAISE EXCEPTION 'SESSION_ALREADY_LINKED' USING ERRCODE = 'P0001';
+   END IF;
+ 
+   UPDATE timer_sessions SET
+     member_id       = p_member_id,
+-    reward_eligible = NULL          -- 结算时才判定，避免留下未经验证的进度资格
++    -- 未结算的等结算时判定；已结算的补挂只记「他来过」，不计进度
++    reward_eligible = CASE WHEN v_session.is_settled THEN FALSE ELSE NULL END
+   WHERE session_id = p_session_id
+   RETURNING * INTO v_session;
+ 
+diff --git "a/docs/\344\274\232\345\221\230\347\263\273\347\273\237\344\272\244\344\273\230\350\257\264\346\230\216.md" "b/docs/\344\274\232\345\221\230\347\263\273\347\273\237\344\272\244\344\273\230\350\257\264\346\230\216.md"
+index 59aba8f..f46c6cd 100644
+--- "a/docs/\344\274\232\345\221\230\347\263\273\347\273\237\344\272\244\344\273\230\350\257\264\346\230\216.md"
++++ "b/docs/\344\274\232\345\221\230\347\263\273\347\273\237\344\272\244\344\273\230\350\257\264\346\230\216.md"
+@@ -20,7 +20,7 @@ NEXT_PUBLIC_APP_URL=
+ 把 `supabase/migrations/016_members.sql`、`017_member_settlement.sql` 按顺序发到数据库执行一次。
+ 怕顺序搞错就直接用 **`docs/上线迁移-一次执行.sql`**（两个文件已按顺序合并成一份，粘一次、按一次 Run 即可）。
+ 
+-测试库 `rlakqwmedlgpcdasvads` 已经执行过，并在真实数据上通过了 52 项校验。**线上站点的数据库不在开发侧**，
++测试库 `rlakqwmedlgpcdasvads` 已经执行过，并在真实数据上通过了 64 项校验。**线上站点的数据库不在开发侧**，
+ 所以这一步由店主侧（或上游 `KeMiaoDaDi` 的技术负责人）在他们的 Supabase 项目里执行一次，开发侧不需要也不应拿到线上库凭据。
+ 顺序不能反，`017` 依赖 `016` 建的表和列。执行方式二选一：
+ 
+@@ -46,7 +46,7 @@ npx tsc --noEmit
+ npm run build
+ ```
+ 
+-数据库层验收：`docs/verify_member_system.sql`，26 项检查，覆盖 VIP 日期边界、刚解锁的奖励能不能当次用、撤销结算后奖励回退、朋友券用在他人的订单上等。整个脚本在一个事务里跑，末尾 `ROLLBACK`，不会留测试数据。
++数据库层验收：`docs/verify_member_system.sql`，40 项检查（按脚本里逐条列出的检查项计），覆盖 VIP 日期边界、刚解锁的奖励能不能当次用、撤销结算后奖励回退、朋友券用在他人的订单上等。整个脚本在一个事务里跑，末尾 `ROLLBACK`，不会留测试数据。
+ 
+ ---
+ 
+@@ -57,7 +57,7 @@ npm run build
+ | `016_members.sql` | 建 `members` 表（邮箱唯一身份、3 条约束、3 个索引、开 RLS）；给 `timer_sessions` 加 `member_id` 与 `reward_eligible` 两列（含 CHECK）；给 `bookings` 加 `idx_bookings_email_key` |
+ | `017_member_settlement.sql` | 建 `member_rewards`（5 条 CHECK、4 个索引）、`member_benefits`（2 条 CHECK、1 个索引）；建 `member_visit_days` 视图；建 6 个函数：`member_vip_active`、`ensure_member_rewards`、`settle_timer_session`（5 参数版换成 8 参数版）、`unsettle_timer_session`、`link_timer_session_to_member`、`activate_member_vip` |
+ 
+-`timer_sessions.reward_eligible` 是一次结算那一刻固化下来的判断（该单是否有会员归属、且结算时没有生效中的 VIP Month），不是事后推算的。因为 VIP 从激活时刻起暂停进度，事后重算会把激活当天算错。
++`timer_sessions.reward_eligible` 是一次结算那一刻固化下来的判断（该单是否有会员归属），不是事后推算的。业主 2026-09-16 口径下 VIP 期间进度照常累积，所以它现在只有两个取值来源：散客单留空（NULL），会员单为 true；只有后台把已结算的散客单补挂到会员名下时才写 false，那一单只算到店次数、不计进度。
+ 
+ **迁移未执行前，应用照常工作**。这是刻意设计的：新代码在解析不出会员时不写 `member_id` 列；结算只在真的用会员折扣时才向 RPC 传新参数。所以计时、预约、优惠券、原有结算全都不受影响，只是会员功能不生效。
+ 
+@@ -95,8 +95,9 @@ npm run build
+ 
+ **两处替 PRD 补的解释，需要店主确认**：
+ 
+-1. **Link to Member 只允许挂尚未结算的订单**。PRD 5.2 没说时点。选严格版本的理由是进度必须来自真实结算记录，允许事后改归属等于绕过台账改数字，正是 PRD 第 25 节要防的事。代价是店员遇到已结算的订单要多点两下：先撤销结算、挂上、再结算。
+-2. **VIP Month 生效期间，普通优惠券也一并禁用**，一律走 85 折。PRD 11.4 的清单只点名了会员奖励。要放开只改 `settle_timer_session` 里 `vip_active AND v_source <> 'vip_month'` 这一处判断。
++1. **Link to Member 允许补挂已结算的订单**（业主 2026-09-16 确认）。PRD 5.2 没说时点。补挂只写归属、把 `reward_eligible` 记 false：到店次数 +1，折扣不退、奖励不补、已收金额不动；已经属于别的会员的订单不能改归属。未结算的单仍照旧挂，进度资格留空、等结算时判定。
++2. **VIP Month 生效期间默认走 85 折，但店员可以手动改用券或会员奖励**（业主 2026-09-16 确认，推翻了原先「一律禁用其他优惠」的严格版本）。当次放弃 VIP 折扣，VIP 的 30 天不顺延；只有「不使用优惠」被拦（避免 VIP 会员按原价结账）。判断收在 `settle_timer_session` 的 `IF v_vip_active AND v_source = 'none'` 一处，TS 侧的镜像在 `lib/member/member.ts` 的 `computeMemberDiscount`。
++3. **VIP 期间进度不再暂停**（业主 2026-09-16 确认，与 PRD 6.2 / 11.4 不一致，PRD 待 v1.1 更新）。VIP 那 30 天的到店照常计入 Reward Progress，因此 VIP 期间攒满 10 次会解锁下一张 VIP Month；按「同一时间只有一张生效」的规矩，那张要等当前这张到期后再手动激活。
+ 
+ ---
+ 
+@@ -113,9 +114,9 @@ npm run build
+ | 权限守卫 | 后台页面未登录 `307 → /login`；后台 API 未登录 `401` |
+ | 迁移未执行时不影响现有功能 | 计时、预约、结算、优惠券路径冒烟测试全部照旧 |
+ | **迁移已在测试项目执行成功** | `rlakqwmedlgpcdasvads` 上按顺序执行 016、017 通过；三张表、一个视图、六个函数全部就位，`settle_timer_session` 也确认没有残留旧版重载 |
+-| **52 项真实数据校验全部通过** | `docs/verify_via_api.py`（走 PostgREST + service key，不需要额外 token） |
++| **64 项真实数据校验全部通过** | `docs/verify_via_api.py`（走 PostgREST + service key，不需要额外 token） |
+ 
+-52 项校验覆盖：视图计数与同日去重、解锁档位与轮次（含第二轮 12 档）与幂等、VIP 日期边界（激活当天 / 到期当天 / 到期次日 / 激活前一天）、VIP 不自动激活、已有生效 VIP 时拒绝再激活、VIP 期间自动 85 折与进度暂停、VIP 期间不许改用其他优惠、£2 券核销与撤销回退（奖励、内部券、进度资格三处都对）、朋友 9 折可在他人的订单上使用、本人 85 折不能给他人、非会员订单不产生任何人的进度、刚解锁的奖励不能用于产生它的那笔消费、奖励已被后续使用则拒绝撤销来源结算、Link to Member 的三条规则（未结算可挂 / 已结算拒绝 / 会员不存在拒绝）。
++64 项校验覆盖：视图计数与同日去重、解锁档位与轮次（含第二轮 12 档）与幂等、VIP 日期边界（激活当天 / 到期当天 / 到期次日 / 激活前一天）、VIP 不自动激活、已有生效 VIP 时拒绝再激活、VIP 期间默认 85 折且进度照常累积、VIP 期间「不使用优惠」被拦而改用券或奖励放行、£2 券核销与撤销回退（奖励、内部券、进度资格三处都对）、朋友 9 折可在他人的订单上使用、本人 85 折不能给他人、非会员订单不产生任何人的进度、刚解锁的奖励不能用于产生它的那笔消费、奖励已被后续使用则拒绝撤销来源结算、Link to Member 的五条规则（未结算可挂 / 已结算可补挂且只记到店 / 补挂不动金额 / 已归属不能改会员 / 会员不存在拒绝）。
+ 
+ **执行迁移时发现并修掉的一个真实 bug**（值得记下来，因为它只有真跑才会暴露）：
+ 
+@@ -139,7 +140,7 @@ npm run build
+ | **一页说明（直接转发给店主）** | `docs/给店主的一页说明.md` | 照着做：粘一次、按一次 Run，不到一分钟 |
+ | 一份合并好的迁移脚本 | `docs/上线迁移-一次执行.sql` | 粘进他们 Supabase 的 SQL Editor，按一次 Run |
+ | 这份交付说明 | `docs/会员系统交付说明.md` | 读「怎么跑起来」和「未完成项」两节 |
+-| 验收脚本（可选） | `docs/verify_via_api.py` | 想复验就在有 service key 的机器上跑一次，应输出 52/52 |
++| 验收脚本（可选） | `docs/verify_via_api.py` | 想复验就在有 service key 的机器上跑一次，应输出 64/64 |
+ 
+ **注意**：`docs/verify_via_api.py` 需要项目的 service key，只在对方自己的机器上跑。本仓库不含任何密钥。
+ 
+diff --git "a/docs/\347\273\231\345\272\227\344\270\273\347\232\204\344\270\200\351\241\265\350\257\264\346\230\216.md" "b/docs/\347\273\231\345\272\227\344\270\273\347\232\204\344\270\200\351\241\265\350\257\264\346\230\216.md"
+index c9bc7bb..f92aa05 100644
+--- "a/docs/\347\273\231\345\272\227\344\270\273\347\232\204\344\270\200\351\241\265\350\257\264\346\230\216.md"
++++ "b/docs/\347\273\231\345\272\227\344\270\273\347\232\204\344\270\200\351\241\265\350\257\264\346\230\216.md"
+@@ -49,7 +49,7 @@
+ 
+ ## 想复验（可选）
+ 
+-仓库里有一份验收脚本 `docs/verify_via_api.py`，覆盖 52 项规则（VIP 日期边界、£2 券核销与撤销回退、朋友券用在他人的订单上、刚解锁的奖励不能当次用等等）。
++仓库里有一份验收脚本 `docs/verify_via_api.py`，覆盖 64 项规则（VIP 日期边界、£2 券核销与撤销回退、朋友券用在他人的订单上、刚解锁的奖励不能当次用等等）。
+ 
+ 在**有该项目 service key 的机器上**，把它放在仓库根目录跑：
+ 
+@@ -57,15 +57,14 @@
+ python3 verify_via_api.py
+ ```
+ 
+-应输出 `通过 52/52`。这个脚本会读写几笔测试数据，跑完会留下两位测试会员（`demo.a@` / `demo.b@tangdouren.test`），可以手工删掉。
++应输出 `通过 64/64`。这个脚本会读写几笔测试数据，跑完会留下两位测试会员（`demo.a@` / `demo.b@tangdouren.test`），可以手工删掉。
+ 
+ ---
+ 
+-## 有两个规则我想请你确认
++## 三条规则（2026-09-16 已确认）
+ 
+-设计时 PRD 没写到的地方，我们按下面这样做了，如果和你的想法不一致，告诉我改：
+-
+-| 情况 | 现在的行为 |
++| 情况 | 规则 |
+ | --- | --- |
+-| VIP 期间还能不能用会员奖励券或优惠券 | **不能用**，必须是 VIP 的 85 折。也就是 VIP 生效期间，其他优惠一律冻结（奖励本身不消失，VIP 结束后照旧可用） |
+-| 后台「把订单挂到会员名下」 | **只允许未结算的订单**。已经结算的单不能再改归属，防止绕过台账改数字 |
++| VIP 生效期间能不能用别的优惠 | **默认按 VIP 的 85 折结算**。顾客如果想用手里那张券或奖励，店员在结算面板点「改用其他优惠」，选中的券或奖励替代 VIP 折扣（当次放弃 VIP，剩余天数不顺延）。什么都不选时系统会拦住，不允许 VIP 会员按原价结账 |
++| VIP 期间到店算不算奖励进度 | **算**。VIP 那 30 天里的到店照常累积进度，攒到第 10 次一样解锁下一张 VIP Month（同一时间只有一张生效，第二张要等这一张到期后再手动激活） |
++| 后台把订单挂到会员名下 | **已结算的订单也能补挂**，但只记「这一单是他来的」：不退折扣、不补发奖励、不动已收金额。已经属于别的会员的订单不能改归属 |
+diff --git a/lib/email/templates/confirmation.ts b/lib/email/templates/confirmation.ts
+index a407f2c..0e46de6 100644
+--- a/lib/email/templates/confirmation.ts
++++ b/lib/email/templates/confirmation.ts
+@@ -17,6 +17,8 @@ export interface ConfirmationEmailData {
+   studioEmail:     string
+   studioMapUrl?:   string
+   lang?:           'zh' | 'en'
++  /** 这次预约同时加入了糖豆人会员（PRD 2.3）。英文版暂不开放会员，因此只写中文那一句 */
++  memberJoined?:   boolean
+ }
+ 
+ export function buildConfirmationEmail(data: ConfirmationEmailData): {
+@@ -29,6 +31,7 @@ export function buildConfirmationEmail(data: ConfirmationEmailData): {
+     studioName, studioAddress, studioEmail,
+     studioMapUrl = 'https://maps.google.com/?q=糖豆人手作',
+     lang = 'zh',
++    memberJoined = false,
+   } = data
+ 
+   const locationUrl = `${process.env.NEXT_PUBLIC_APP_URL ?? 'https://www.tangdouren.co.uk'}/location`
+@@ -58,6 +61,13 @@ export function buildConfirmationEmail(data: ConfirmationEmailData): {
+         ? `✅ Booking confirmed — no deposit required. Pay in full on arrival.`
+         : `✅ 预约已确认，无需预付定金，到店结清即可`)
+ 
++  // 加入会员只在中文预约里发生（英文版不开放会员），所以这一句只有中文版
++  const memberBadge = memberJoined && !isEn
++    ? `<div style="background:#fdf1ee;border:1px solid #f3d6cd;border-radius:8px;padding:12px 16px;margin-bottom:24px;font-size:14px;color:#8a4a35;line-height:1.6;">
++        🎉 你已加入<strong>糖豆人会员</strong>：每次到店计时都累积进度，满 2 次得 £2 抵用券，满 5 次得 £5，满 10 次解锁 VIP 月卡。到店扫桌上的二维码，就能在自己的手机上查看进度。
++      </div>`
++    : ''
++
+   const locationWarning = isEn
+     ? `⚠️ Our studio is inside an office building and can be a little tricky to find on your first visit. Please read the Location Guide <strong>before you leave home</strong>!`
+     : `⚠️ 本工作室位于写字楼内部，初次到访可能不易找到，请在<strong>出发前</strong>仔细阅读地点指引！`
+@@ -152,6 +162,8 @@ export function buildConfirmationEmail(data: ConfirmationEmailData): {
+ 
+       <div class="deposit-badge">${depositBadge}</div>
+ 
++      ${memberBadge}
++
+       <div class="policy-box">
+         <strong>${policyTitle}</strong><br />
+         ${policyBody}
+diff --git a/lib/i18n/translations.ts b/lib/i18n/translations.ts
+index 30b6779..a4bb13c 100644
+--- a/lib/i18n/translations.ts
++++ b/lib/i18n/translations.ts
+@@ -338,9 +338,9 @@ export const t = {
+   step4DepositOff:   { zh: '✅ 提交后名额立即锁定，无需支付定金，到店结清即可', en: '✅ Your spot is confirmed instantly — no deposit required, just pay on arrival' },
+   step4Submitting:   { zh: '处理中…',        en: 'Processing…' },
+   step4Submit:       { zh: '确认预约',        en: 'Confirm Booking' },
+-  step4JoinClub:     { zh: '顺便加入 Tangdouren Club', en: 'Also join Tangdouren Club' },
+-  step4JoinClubHint: { zh: '每次到店计时都累积进度：满 2 次 £2 抵用券，满 5 次 £5，满 8 次本人 85 折加朋友 9 折，满 10 次送一个月 VIP。不想加入也能直接预约。', en: 'Every in-store visit builds progress: 2 visits for a £2 voucher, 5 for £5, 8 for 15% off for you and 10% off for a friend, 10 for a VIP Month. Joining is optional.' },
+-  step5MemberJoined: { zh: '✅ 你已加入 Tangdouren Club，到店扫码后就能用自己的手机看到进度。', en: '✅ You have joined Tangdouren Club — scan in store to track your progress on your phone.' },
++  step4JoinClub:     { zh: '顺便加入糖豆人会员', en: 'Also join Tangdouren Membership' },
++  step4JoinClubHint: { zh: '每次到店计时都累积进度：满 2 次 £2 抵用券，满 5 次 £5，满 8 次本人 85 折加朋友 9 折，满 10 次送一张 VIP 月卡。不想加入也能直接预约。', en: 'Every in-store visit builds progress: 2 visits for a £2 voucher, 5 for £5, 8 for 15% off for you and 10% off for a friend, 10 for a VIP Month. Joining is optional.' },
++  step5MemberJoined: { zh: '✅ 你已加入糖豆人会员，到店扫码后就能用自己的手机看到进度。', en: '✅ You have joined Tangdouren Membership — scan in store to track your progress on your phone.' },
+   step4NetworkErr:   { zh: '网络错误，请检查连接后重试', en: 'Network error, please check your connection and try again' },
+ 
+   // Step 5 – Done
+diff --git a/lib/member/member.ts b/lib/member/member.ts
+index 3666b96..e5fe7c7 100644
+--- a/lib/member/member.ts
++++ b/lib/member/member.ts
+@@ -124,6 +124,26 @@ export function isVipActive(benefits: VipBenefitRow[], londonDate: string): bool
+   return benefits.some(b => isVipBenefitActiveOn(b, londonDate))
+ }
+ 
++/**
++ * VIP 月卡这类奖励**自身**的状态，由权益日期派生（不存状态字段）：
++ *   ready  = 已解锁、还没激活
++ *   active = 生效中（到期日当天仍算生效）
++ *   ended  = 已经过期
++ * 传进来的不是 VIP 月卡（没有权益行）时返回 null，交给调用方按普通奖励处理。
++ * 日期都是伦敦当地 YYYY-MM-DD，字符串比较即可（同 isVipBenefitActiveOn 的口径）。
++ */
++export type VipRewardState = 'ready' | 'active' | 'ended'
++
++export function vipRewardState(
++  benefit: VipBenefitRow | null | undefined,
++  londonToday: string,
++): VipRewardState | null {
++  if (!benefit) return null
++  if (!benefit.activated_on) return 'ready'
++  if (benefit.expires_on && benefit.expires_on < londonToday) return 'ended'
++  return 'active'
++}
++
+ // ── Visit 口径（与 member_visit_days 视图同口径）────────────────────────────
+ 
+ export interface VisitSessionRow {
+@@ -132,6 +152,9 @@ export interface VisitSessionRow {
+   started_at:      string
+   is_settled:      boolean
+   reward_eligible: boolean | null
++  /** 下面两个只有会员页要用来区分「这次是不是走了 VIP 折扣」，Visit 口径本身不需要 */
++  discount_amount_gbp?: number | null
++  coupon_code_snapshot?: string | null
+ }
+ 
+ export interface VisitDay {
+@@ -160,7 +183,11 @@ export function countLifetimeVisits(visits: VisitDay[]): number {
+   return visits.length
+ }
+ 
+-/** Reward Progress：只认计入进度的访日。VIP 期间 Lifetime 加、Progress 不加（PRD 6.2） */
++/**
++ * Reward Progress：只认计入进度的访日。
++ * 业主 2026-09-16 口径：VIP 期间进度照常累积，所以 false 只来自后台补挂的已结算单，
++ * 那一单进 Lifetime、不进 Progress。
++ */
+ export function countRewardProgress(visits: VisitDay[]): number {
+   return visits.filter(v => v.reward_eligible).length
+ }
+@@ -260,7 +287,10 @@ export interface RewardAvailability {
+ 
+ /**
+  * 单个奖励当前能不能用。顺序不能变：
+- *   已用 → 已转赠成券（Friend 10% 转赠后不能再用，PRD 10.4）→ VIP 期间暂停（PRD 11.4）→ 可用
++ *   已用 → 已转赠成券（Friend 10% 转赠后不能再用，PRD 10.4）→ VIP 生效中 → 可用
++ *
++ * paused_by_vip 的含义是「顾客端不能自行使用」：业主 2026-09-16 口径下，VIP 期间进度照常累积、
++ * 奖励也不作废，店员可以在结算台手动改用（见 computeMemberDiscount），所以它拦的是顾客自助那条路。
+  */
+ export function rewardState(reward: MemberRewardRow, vipActive: boolean): RewardState {
+   if (reward.used_at) return 'used'
+@@ -269,7 +299,7 @@ export function rewardState(reward: MemberRewardRow, vipActive: boolean): Reward
+   return 'available'
+ }
+ 
+-/** My Rewards 列表：VIP 期间其他奖励继续显示、只是标成不可用，不隐藏（PRD 11.4、13.1） */
++/** My Rewards 列表：VIP 生效期间其他奖励继续显示、只标成顾客端不可自行使用，不隐藏（PRD 13.1） */
+ export function rewardAvailabilityList(
+   rewards: MemberRewardRow[],
+   vipActive: boolean,
+@@ -284,22 +314,26 @@ export function rewardAvailabilityList(
+ export function pickRewardForUse(
+   rewards: MemberRewardRow[],
+   rewardType: RewardType,
+-  vipActive: boolean,
+   excludeSessionId?: string | null,
+ ): MemberRewardRow | null {
++  // 不按 VIP 过滤：VIP 期间店员可以手动改用（业主 2026-09-16 口径），
++  // 顾客端的限制由 rewardAvailabilityList 负责。
+   const candidates = rewards
+     .filter(r => r.reward_type === rewardType)
+-    .filter(r => rewardState(r, vipActive) === 'available')
++    .filter(r => rewardState(r, false) === 'available')
+     .filter(r => !excludeSessionId || r.reward_id !== excludeSessionId)
+     .sort((a, b) => a.unlocked_at.localeCompare(b.unlocked_at) || a.reward_id.localeCompare(b.reward_id))
+   return candidates[0] ?? null
+ }
+ 
+-/** 会员当前可选的奖励类型（去重，供结算台下拉用；PRD 21） */
+-export function usableRewardTypes(rewards: MemberRewardRow[], vipActive: boolean): RewardType[] {
++/**
++ * 会员当前可选的奖励类型（去重，供结算台下拉用；PRD 21）。
++ * 同样不按 VIP 过滤：VIP 期间结算台要能列出奖励供店员手动改用（业主 2026-09-16 口径）。
++ */
++export function usableRewardTypes(rewards: MemberRewardRow[]): RewardType[] {
+   const types = rewards
+     .filter(r => USABLE_REWARD_TYPES.includes(r.reward_type))
+-    .filter(r => rewardState(r, vipActive) === 'available')
++    .filter(r => rewardState(r, false) === 'available')
+     .map(r => r.reward_type)
+   return [...new Set(types)]
+ }
+@@ -395,8 +429,9 @@ export function computeMemberDiscount(
+   }
+   const prePence = toPence(ctx.amountGbp)
+ 
+-  // VIP 生效期间系统强制走 VIP 折扣，店员不能改用其他会员奖励（PRD 11.4、21）
+-  if (ctx.vipActive && source !== 'vip_month') {
++  // VIP 生效期间默认走 VIP 折扣；只有「不打折」被拒。
++  // 业主 2026-09-16 口径：店员可以在柜台改用券或会员奖励，当次放弃 VIP 折扣，VIP 的 30 天不顺延。
++  if (ctx.vipActive && source === 'none') {
+     return { ok: false, error: 'VIP_MUST_BE_APPLIED' }
+   }
+ 
+diff --git a/lib/member/service.ts b/lib/member/service.ts
+index 7de2828..ac19783 100644
+--- a/lib/member/service.ts
++++ b/lib/member/service.ts
+@@ -13,8 +13,7 @@ import {
+   isVipActive,
+   londonDateOf,
+   maskEmail,
+-  rewardState,
+-  USABLE_REWARD_TYPES,
++  usableRewardTypes,
+   nextReward,
+   normalizeMemberEmail,
+   progressBarCells,
+@@ -131,7 +130,7 @@ export interface MemberVisitEntry {
+   visit_date:            string
+   started_at:            string
+   counted_for_progress:  boolean
+-  progress_paused:       boolean          // VIP 期间：Lifetime 加、Progress 不加（PRD 14）
++  progress_paused:       boolean          // 这次到店是否计入奖励进度（false = 后台补挂，只计 Lifetime）
+   used_reward:           RewardType | null
+   used_vip:              boolean
+ }
+@@ -167,7 +166,7 @@ export interface MemberDashboard {
+ async function loadMemberSessions(admin: AdminClient, memberId: string, limit: number) {
+   const { data, error } = await admin
+     .from('timer_sessions')
+-    .select('session_id, member_id, started_at, is_settled, reward_eligible, amount_gbp, actual_amount_gbp')
++    .select('session_id, member_id, started_at, is_settled, reward_eligible, amount_gbp, actual_amount_gbp, discount_amount_gbp, coupon_code_snapshot')
+     .eq('member_id', memberId)
+     .order('started_at', { ascending: false })
+     .limit(limit)
+@@ -233,7 +232,12 @@ export async function getMemberDashboard(
+       counted_for_progress: Boolean(s.reward_eligible),
+       progress_paused:      s.reward_eligible === false,
+       used_reward:          usedBySession.get(s.session_id) ?? null,
+-      used_vip:             s.reward_eligible === false,
++      // 这单是不是走的 VIP 折扣：有折扣金额、没走券也没走奖励，剩下来只有 VIP。
++      // 业主 2026-09-16 之前这里靠 reward_eligible 判断（那时它等于「结算时 VIP 生效」），
++      // 进度不再暂停后那个代理失效，改用折扣快照列。
++      used_vip:             (s.discount_amount_gbp ?? 0) > 0
++                              && !s.coupon_code_snapshot
++                              && !usedBySession.has(s.session_id),
+     }))
+ 
+   return {
+@@ -309,10 +313,8 @@ export async function getMemberSettleInfo(
+     member,
+     vipActive,
+     vipExpiresOn: activeBenefit?.expires_on ?? null,
+-    usableTypes:  rewards.filter(r => USABLE_REWARD_TYPES.includes(r.reward_type))
+-                         .filter(r => rewardState(r, vipActive) === 'available')
+-                         .map(r => r.reward_type)
+-                         .filter((t, i, arr) => arr.indexOf(t) === i),
++      // 不按 VIP 过滤：VIP 生效期间结算台也要列出奖励，店员可以手动改用（业主 2026-09-16 口径）
++    usableTypes:  usableRewardTypes(rewards),
+     rewards,
+   }
+ }
+@@ -335,7 +337,8 @@ export function mapMemberError(message: string | undefined | null): string {
+     ['MEMBER_BENEFITS_FAILED',          '读取 VIP 记录失败，请重试'],
+     ['MEMBER_LIST_FAILED',              '读取会员列表失败，请重试'],
+     ['SESSION_NOT_FOUND',               '计时订单不存在'],
+-    ['SESSION_ALREADY_SETTLED',         '该订单已结算，请先撤销结算再关联会员'],
++    ['SESSION_ALREADY_SETTLED',         '该订单已经结算过了'],
++    ['SESSION_ALREADY_LINKED',          '该订单已经属于别的会员，不能改归属'],
+     ['MEMBER_REQUIRED',                 '该订单没有关联会员'],
+     ['MEMBER_SESSION_MISMATCH',         '这类奖励只能用于本人的订单，请先把订单关联到会员'],
+     ['MEMBER_REWARD_NOT_FOUND',         '找不到该奖励'],
+diff --git a/supabase/migrations/017_member_settlement.sql b/supabase/migrations/017_member_settlement.sql
+index 0bc045d..3bb6130 100644
+--- a/supabase/migrations/017_member_settlement.sql
++++ b/supabase/migrations/017_member_settlement.sql
+@@ -22,6 +22,10 @@
+ --   3) 折扣来源是单选枚举（none / coupon / member_reward / vip_month），从结构上排除叠加（PRD 21）。
+ --   4) 金额仍由 TypeScript 先算（lib/coupon/coupon.ts），SQL 用自己查到的券或奖励记录复核，
+ --      对不上抛错。**改动折扣逻辑必须同时改这两处**，否则会出现预览金额与最终结算不一致。
++--   5) 业主 2026-09-16 口径修正（与 PRD 6.2 / 11.4 不一致，PRD 待 v1.1 更新）：
++--      ① VIP 生效期间折扣默认走 VIP，店员可在结算台手动改用券或会员奖励，当次放弃 VIP 折扣；
++--      ② VIP 期间进度照常累积，不再暂停。
++--   6) 已结算的散客单允许在后台账补挂到会员名下，只记到店次数，不追折扣、不补发奖励。
+ -- ============================================================
+ 
+ -- ── 1. member_rewards ────────────────────────────────────────────────────────
+@@ -352,12 +356,15 @@ BEGIN
+     RAISE EXCEPTION 'MULTIPLE_DISCOUNT_SOURCES' USING ERRCODE = 'P0001';
+   END IF;
+ 
+-  -- 3. VIP 生效期间强制走 VIP 折扣（PRD 11.4 / 21）。
+-  --    这里故意抛错而不是静默改写：TypeScript 侧的预览必须同步改，否则预览金额与最终结算会不一致。
++  -- 3. VIP 生效期间默认走 VIP 折扣（PRD 11.4 / 21 + 业主 2026-09-16 口径）。
++  --    默认 = vip_month；但店员可以在柜台手动改用券或会员奖励，当次放弃 VIP 折扣，
++  --    VIP 的 30 天不会因此顺延。折扣类型与数值照样落在快照列里，报表可查。
++  --    这里只拦「不打折」：VIP 会员按原价结账只会是漏选，不是业务意图。
++  --    故意抛错而不是静默改写：TypeScript 侧的预览必须同步改，否则预览金额与最终结算会不一致。
+   IF v_session.member_id IS NOT NULL THEN
+     v_vip_active := member_vip_active(v_session.member_id);
+   END IF;
+-  IF v_vip_active AND v_source <> 'vip_month' THEN
++  IF v_vip_active AND v_source = 'none' THEN
+     RAISE EXCEPTION 'VIP_MUST_BE_APPLIED' USING ERRCODE = 'P0001';
+   END IF;
+ 
+@@ -478,11 +485,14 @@ BEGIN
+   END IF;
+ 
+   -- 5. 固化本次消费是否计入 Reward Progress（PRD 19.2）。
+-  --    散客单不判定，留 NULL；会员单在结算这一刻看有没有生效中的 VIP。
++  --    散客单不判定，留 NULL；会员单一律计入。
++  --    业主 2026-09-16 口径：VIP 期间进度照常累积，不再按「有没有生效中的 VIP」暂停。
++  --    所以 false 现在只有一个来源：后台把已结算的散客单补挂到会员名下（见第 7 节），
++  --    那一单只算 Lifetime Visits、不走进度。
+   IF v_session.member_id IS NULL THEN
+     v_reward_eligible := NULL;
+   ELSE
+-    v_reward_eligible := NOT v_vip_active;
++    v_reward_eligible := TRUE;
+   END IF;
+ 
+   -- 会员券类奖励的内部券码，仅作快照留痕，顾客端不展示
+@@ -693,8 +703,11 @@ $$;
+ -- ── 7. 后台动作：把订单关联到会员、激活 VIP Month ────────────────────────────
+ 
+ -- 顾客以散客身份开始计时后才想起自己是会员时，店员在后台把订单挂到会员名下（PRD 5.2）。
+--- 只允许挂「尚未结算」的单：进度必须来自真实结算记录，已结算的单要先撤销结算再挂，
+--- 否则等于绕过结算台账手动改数字（PRD 16.3、18）。
++-- 业主 2026-09-16 口径：已结算的单也允许补挂，但只补「这一单是他来的」，
++-- 不追折扣、不补发奖励、不动已收金额，所以这一单写 reward_eligible = false，
++-- 只进 Lifetime Visits、不进 Reward Progress。
++-- 守两条线：① 已归属到别的会员的单不再改归属，否则等于把一次到店从甲挪到乙；
++--           ② 未结算的单挂上后 reward_eligible 留 NULL，等结算时按会员单判定。
+ CREATE OR REPLACE FUNCTION public.link_timer_session_to_member(
+   p_session_id text,
+   p_member_id  uuid
+@@ -714,13 +727,17 @@ BEGIN
+   IF NOT FOUND THEN
+     RAISE EXCEPTION 'SESSION_NOT_FOUND' USING ERRCODE = 'P0001';
+   END IF;
+-  IF v_session.is_settled THEN
+-    RAISE EXCEPTION 'SESSION_ALREADY_SETTLED' USING ERRCODE = 'P0001';
++  -- 已结算的单只允许「补挂」，不允许改归属
++  IF v_session.is_settled
++     AND v_session.member_id IS NOT NULL
++     AND v_session.member_id IS DISTINCT FROM p_member_id THEN
++    RAISE EXCEPTION 'SESSION_ALREADY_LINKED' USING ERRCODE = 'P0001';
+   END IF;
+ 
+   UPDATE timer_sessions SET
+     member_id       = p_member_id,
+-    reward_eligible = NULL          -- 结算时才判定，避免留下未经验证的进度资格
++    -- 未结算的等结算时判定；已结算的补挂只记「他来过」，不计进度
++    reward_eligible = CASE WHEN v_session.is_settled THEN FALSE ELSE NULL END
+   WHERE session_id = p_session_id
+   RETURNING * INTO v_session;
+ 
+diff --git a/tests/member.test.ts b/tests/member.test.ts
+index 1820544..2b3b122 100644
+--- a/tests/member.test.ts
++++ b/tests/member.test.ts
+@@ -31,6 +31,7 @@ import {
+   usableRewardTypes,
+   vipExpiresOn,
+   vipMonthSummary,
++  vipRewardState,
+   type MemberRewardRow,
+   type RewardType,
+   type VisitSessionRow,
+@@ -125,7 +126,7 @@ test('散客单与未结算单都不计入', () => {
+   assert.equal(countRewardProgress(visits), 0)
+ })
+ 
+-test('VIP 期间 Lifetime 加、Reward Progress 不加，两个数因此会不同', () => {
++test('后台补挂的已结算单进 Lifetime、不走进度，两个数因此会不同', () => {
+   const visits = buildVisitDays([
+     session('2026-09-10T12:00:00Z', { reward_eligible: true }),
+     session('2026-09-11T12:00:00Z', { reward_eligible: false }),
+@@ -135,8 +136,8 @@ test('VIP 期间 Lifetime 加、Reward Progress 不加，两个数因此会不
+   assert.equal(countRewardProgress(visits), 1)
+ })
+ 
+-test('VIP 激活当天：激活前完成的那条进度不回退', () => {
+-  // 同一天两条单，一条在激活前（eligible），一条在激活后（不 eligible）
++test('同一天只要有一条计入进度，这一天就算（补挂不会回退已完成的进度）', () => {
++  // 同一天两条单：一条计入进度，一条（后台补挂）不计入
+   const visits = buildVisitDays([
+     session('2026-09-18T09:00:00Z', { reward_eligible: true }),
+     session('2026-09-18T18:00:00Z', { reward_eligible: false, session_id: 'T-2' }),
+@@ -235,7 +236,7 @@ test('奖励节点表就是 PRD 第 7 节那张表', () => {
+ 
+ // ── 奖励可用性 ──────────────────────────────────────────────────────────────
+ 
+-test('奖励状态：已用 > 已转赠 > VIP 期间暂停 > 可用', () => {
++test('奖励状态：已用 > 已转赠 > VIP 生效中（顾客不可自行使用）> 可用', () => {
+   assert.equal(rewardState(reward('TWO_POUND', { used_at: '2026-09-20T10:00:00Z' }), false), 'used')
+   assert.equal(rewardState(reward('FRIEND_10_OFF', { coupon_id: 'coupon-x' }), false), 'transferred')
+   assert.equal(rewardState(reward('PERSONAL_15_OFF'), true), 'paused_by_vip')
+@@ -251,17 +252,16 @@ test('VIP 期间其他奖励继续显示，只是标成不可用', () => {
+ test('同类多张时挑最早解锁的那张，与 SQL 的排序一致', () => {
+   const older = reward('TWO_POUND', { reward_id: 'reward-a', unlocked_at: '2026-09-01T10:00:00Z' })
+   const newer = reward('TWO_POUND', { reward_id: 'reward-b', unlocked_at: '2026-09-05T10:00:00Z' })
+-  assert.equal(pickRewardForUse([newer, older], 'TWO_POUND', false)?.reward_id, 'reward-a')
++  assert.equal(pickRewardForUse([newer, older], 'TWO_POUND')?.reward_id, 'reward-a')
+ })
+ 
+-test('挑券时跳过已用、已转赠与 VIP 暂停的', () => {
++test('挑券时跳过已用、已转赠的（VIP 期间也能挑，供店员手动改用）', () => {
+   const used = reward('TWO_POUND', { reward_id: 'reward-a', used_at: '2026-09-20T10:00:00Z' })
+   const ok = reward('TWO_POUND', { reward_id: 'reward-b' })
+-  assert.equal(pickRewardForUse([used, ok], 'TWO_POUND', false)?.reward_id, 'reward-b')
+-  assert.equal(pickRewardForUse([ok], 'TWO_POUND', true), null)
++  assert.equal(pickRewardForUse([used, ok], 'TWO_POUND')?.reward_id, 'reward-b')
+ 
+   const transferred = reward('FRIEND_10_OFF', { reward_id: 'reward-c', coupon_id: 'coupon-x' })
+-  assert.equal(pickRewardForUse([transferred], 'FRIEND_10_OFF', false), null)
++  assert.equal(pickRewardForUse([transferred], 'FRIEND_10_OFF'), null)
+ })
+ 
+ test('结算台可选奖励去重后按类型给出', () => {
+@@ -271,8 +271,7 @@ test('结算台可选奖励去重后按类型给出', () => {
+     reward('PERSONAL_15_OFF', { reward_id: 'reward-c' }),
+     reward('VIP_MONTH', { reward_id: 'reward-d' }),
+   ]
+-  assert.deepEqual(usableRewardTypes(rewards, false), ['TWO_POUND', 'PERSONAL_15_OFF'])
+-  assert.deepEqual(usableRewardTypes(rewards, true), [])
++  assert.deepEqual(usableRewardTypes(rewards), ['TWO_POUND', 'PERSONAL_15_OFF'])
+ })
+ 
+ // ── VIP Month ───────────────────────────────────────────────────────────────
+@@ -304,6 +303,17 @@ test('未激活的 VIP Month 不生效', () => {
+   assert.equal(isVipActive([notActivated], '2026-09-18'), false)
+ })
+ 
++test('VIP 月卡奖励自身的状态：未激活 / 生效中（含到期日）/ 已结束', () => {
++  const pending = { benefit_id: 'b1', reward_id: 'r1', activated_on: null, expires_on: null }
++  const running = { benefit_id: 'b2', reward_id: 'r2', activated_on: '2026-09-17', expires_on: '2026-10-16' }
++
++  assert.equal(vipRewardState(pending, '2026-09-20'), 'ready')
++  assert.equal(vipRewardState(running, '2026-09-17'), 'active')   // 激活当天
++  assert.equal(vipRewardState(running, '2026-10-16'), 'active')   // 到期日当天仍生效
++  assert.equal(vipRewardState(running, '2026-10-17'), 'ended')    // 次日结束
++  assert.equal(vipRewardState(null, '2026-09-20'), null)          // 不是月卡（没有权益行）
++})
++
+ test('可以累计多张未激活的 VIP Month，同一时间只有一张生效', () => {
+   const rewards = [
+     reward('VIP_MONTH', { reward_id: 'reward-v1', cycle_index: 1 }),
+@@ -365,9 +375,16 @@ test('不打折时金额原样返回', () => {
+   assert.equal(none.ok && none.preview.finalGbp, 25.99)
+ })
+ 
+-test('VIP 生效期间强制走 VIP，其他会员奖励一律拒绝', () => {
+-  const blocked = computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: true, rewardType: 'TWO_POUND' })
++test('VIP 生效期间：不选优惠被拒，手动改用券或奖励放行（业主 2026-09-16 口径）', () => {
++  // 默认走 VIP，但「什么都不选」会让 VIP 会员按原价结账，属于漏选，必须拦住
++  const blocked = computeMemberDiscount('none', { amountGbp: 13.99, vipActive: true })
+   assert.deepEqual(blocked, { ok: false, error: 'VIP_MUST_BE_APPLIED' })
++
++  // 店员在柜台改用会员奖励：当次放弃 VIP 折扣，金额按奖励算
++  const overridden = computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: true, rewardType: 'TWO_POUND' })
++  assert.equal(overridden.ok, true)
++  if (overridden.ok) assert.equal(overridden.preview.discountAmountPence, 200)
++
+   const notVip = computeMemberDiscount('vip_month', { amountGbp: 13.99, vipActive: false })
+   assert.deepEqual(notVip, { ok: false, error: 'VIP_NOT_ACTIVE' })
+ })

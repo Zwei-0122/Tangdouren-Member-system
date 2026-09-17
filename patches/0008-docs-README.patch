@@ -1,0 +1,27 @@
+From 319c7ec25062272aaff3eeb18eb467c506ea0270 Mon Sep 17 00:00:00 2001
+From: Zwei-0122 <325088970+Zwei-0122@users.noreply.github.com>
+Date: Thu, 17 Sep 2026 13:20:10 +0100
+Subject: [PATCH 8/8] =?UTF-8?q?docs:=20README=20=E5=8E=BB=E6=8E=89?=
+ =?UTF-8?q?=E3=80=8C=E6=9C=AC=E7=AB=99=E6=98=AF=E5=AE=98=E7=BD=91=E5=89=AF?=
+ =?UTF-8?q?=E6=9C=AC=E3=80=8D=E7=9A=84=E8=AF=B4=E6=B3=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+这份改动会作为补丁进对方的主站仓库，自称副本在那边是假话。
+---
+ README.md | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/README.md b/README.md
+index 1b5566c..aca22bd 100644
+--- a/README.md
++++ b/README.md
+@@ -1,6 +1,6 @@
+ # 糖豆人手工工作室 官网 + 糖豆人会员系统
+ 
+-这是 [糖豆人手工工作室官网](https://github.com/KeMiaoDaDi/Tangdouren) 的一份完整副本，包含 **糖豆人会员系统**的完整实现。克隆下来装好依赖、填好环境变量、在 Supabase 执行两个迁移，就能在本地跑起来。
++糖豆人手工工作室的官网，含 **糖豆人会员系统**的完整实现。装好依赖、填好环境变量、在 Supabase 执行两个迁移，就能在本地跑起来。
+ 
+ 技术栈：Next.js 16（App Router）、TypeScript、Supabase、Tailwind CSS。
+ 

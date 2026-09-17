@@ -1,0 +1,4674 @@
+From 64f56e74355107a40254eb0aa6b1f79cae582e01 Mon Sep 17 00:00:00 2001
+From: Zwei-0122 <325088970+Zwei-0122@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 20:42:46 +0100
+Subject: [PATCH 1/8] =?UTF-8?q?feat(member):=20Tangdouren=20Club=20?=
+ =?UTF-8?q?=E4=BC=9A=E5=91=98=E7=B3=BB=E7=BB=9F?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+身份（邮箱即身份，设备记忆）、到店进度（按伦敦自然日去重）、
+奖励引擎（2/5/8/10 档位，第二轮 12/15/18/20）、VIP Month
+（30 天含首尾，期间进度暂停、结算自动 85 折）、结算接入与撤销回退。
+
+- 迁移 016/017：members、member_rewards、member_benefits 三张表，
+  member_visit_days 视图，六个函数。尚未在任何数据库执行。
+- 纯函数层 32 项测试；类型检查与构建通过。
+- 迁移未执行前不破坏现有计时、预约、结算路径。
+---
+ app/(admin)/dashboard/members/[id]/page.tsx   | 286 ++++++
+ app/(admin)/dashboard/members/page.tsx        | 115 +++
+ app/(admin)/dashboard/timers/[id]/page.tsx    | 152 +++-
+ app/(admin)/dashboard/timers/page.tsx         |   6 +
+ app/(site)/booking/page.tsx                   |  26 +-
+ app/(site)/self-timer/club/page.tsx           | 327 +++++++
+ app/(site)/self-timer/page.tsx                | 177 +++-
+ app/api/admin/members/[id]/route.ts           | 125 +++
+ app/api/admin/members/route.ts                |  25 +
+ app/api/admin/timers/[id]/route.ts            |  89 +-
+ app/api/admin/timers/route.ts                 |  19 +-
+ app/api/bookings/route.ts                     |  26 +-
+ app/api/member/activate-vip/route.ts          |  57 ++
+ app/api/member/dashboard/route.ts             |  45 +
+ app/api/member/join/route.ts                  |  54 ++
+ app/api/member/lookup/route.ts                |  49 ++
+ app/api/self-timer/start/route.ts             |   4 +
+ components/admin/Sidebar.tsx                  |   3 +-
+ components/member/MemberProgressBar.tsx       |  92 ++
+ lib/coupon/service.ts                         |  16 +
+ lib/i18n/translations.ts                      |   3 +
+ lib/member/client.ts                          |  37 +
+ lib/member/member.ts                          | 463 ++++++++++
+ lib/member/service.ts                         | 533 ++++++++++++
+ lib/timer/selfService.ts                      |  40 +-
+ supabase/migrations/016_members.sql           |  99 +++
+ supabase/migrations/017_member_settlement.sql | 814 ++++++++++++++++++
+ tests/member.test.ts                          | 396 +++++++++
+ 28 files changed, 4034 insertions(+), 44 deletions(-)
+ create mode 100644 app/(admin)/dashboard/members/[id]/page.tsx
+ create mode 100644 app/(admin)/dashboard/members/page.tsx
+ create mode 100644 app/(site)/self-timer/club/page.tsx
+ create mode 100644 app/api/admin/members/[id]/route.ts
+ create mode 100644 app/api/admin/members/route.ts
+ create mode 100644 app/api/member/activate-vip/route.ts
+ create mode 100644 app/api/member/dashboard/route.ts
+ create mode 100644 app/api/member/join/route.ts
+ create mode 100644 app/api/member/lookup/route.ts
+ create mode 100644 components/member/MemberProgressBar.tsx
+ create mode 100644 lib/member/client.ts
+ create mode 100644 lib/member/member.ts
+ create mode 100644 lib/member/service.ts
+ create mode 100644 supabase/migrations/016_members.sql
+ create mode 100644 supabase/migrations/017_member_settlement.sql
+ create mode 100644 tests/member.test.ts
+
+diff --git a/app/(admin)/dashboard/members/[id]/page.tsx b/app/(admin)/dashboard/members/[id]/page.tsx
+new file mode 100644
+index 0000000..e003972
+--- /dev/null
++++ b/app/(admin)/dashboard/members/[id]/page.tsx
+@@ -0,0 +1,286 @@
++'use client'
++
++// 后台会员详情（PRD 16）：能挂订单、核销/转赠、代激活 VIP、停用；
++// 不能手动加减 Visit、不能直接改 Reward Progress、不能改邮箱、不能删历史。
++
++import { useCallback, useEffect, useState } from 'react'
++import { useParams, useRouter } from 'next/navigation'
++import { ArrowLeft, Crown, Gift, Link2 } from 'lucide-react'
++import Sidebar from '@/components/admin/Sidebar'
++import MemberProgressBar from '@/components/member/MemberProgressBar'
++import type { MemberDashboard, MemberRewardEntry } from '@/lib/member/service'
++import type { RewardType } from '@/lib/member/member'
++
++interface MemberRow {
++  member_id:    string
++  email:        string
++  display_name: string | null
++  joined_at:    string
++  is_active:    boolean
++}
++
++const rewardLabels: Record<RewardType, string> = {
++  TWO_POUND:       '£2 抵用券',
++  FIVE_POUND:      '£5 抵用券',
++  PERSONAL_15_OFF: '本人 85 折',
++  FRIEND_10_OFF:   '朋友 9 折',
++  VIP_MONTH:       'VIP Month',
++}
++
++const stateLabels: Record<string, string> = {
++  available:     '可用',
++  used:          '已使用',
++  paused_by_vip: 'VIP 结束后可用',
++  transferred:   '已转赠给朋友',
++}
++
++export default function MemberDetailPage() {
++  const { id }  = useParams<{ id: string }>()
++  const router  = useRouter()
++
++  const [member, setMember]       = useState<MemberRow | null>(null)
++  const [dashboard, setDashboard] = useState<MemberDashboard | null>(null)
++  const [loading, setLoading]     = useState(true)
++  const [busy, setBusy]           = useState('')
++  const [error, setError]         = useState('')
++  const [notice, setNotice]       = useState('')
++  const [nameEdit, setNameEdit]   = useState('')
++  const [sessionId, setSessionId] = useState('')
++  const [couponCode, setCouponCode] = useState('')
++  const [couponFor, setCouponFor]   = useState('')
++
++  const load = useCallback(async () => {
++    try {
++      const res  = await fetch(`/api/admin/members/${id}`)
++      const data = await res.json() as { member?: MemberRow; dashboard?: MemberDashboard; error?: string }
++      if (!res.ok || !data.member) { setError(data.error ?? '找不到该会员'); return }
++      setMember(data.member)
++      setDashboard(data.dashboard ?? null)
++      setNameEdit(data.member.display_name ?? '')
++    } catch {
++      setError('网络错误，请重试')
++    } finally {
++      setLoading(false)
++    }
++  }, [id])
++
++  useEffect(() => { void load() }, [load])
++
++  async function act(action: string, payload: Record<string, unknown>, key: string) {
++    setBusy(key)
++    setError('')
++    setNotice('')
++    try {
++      const res  = await fetch(`/api/admin/members/${id}`, {
++        method:  'PATCH',
++        headers: { 'Content-Type': 'application/json' },
++        body:    JSON.stringify({ action, ...payload }),
++      })
++      const data = await res.json() as { error?: string }
++      if (!res.ok) { setError(data.error ?? '操作失败'); return false }
++      await load()
++      return true
++    } catch {
++      setError('网络错误，请重试')
++      return false
++    } finally {
++      setBusy('')
++    }
++  }
++
++  const fmt = (iso: string | null | undefined) =>
++    iso ? new Date(iso).toLocaleString('zh-CN', { timeZone: 'Europe/London' }) : '—'
++
++  const readyVip    = (dashboard?.rewards ?? []).filter(r => r.reward.reward_type === 'VIP_MONTH' && !r.benefit?.activated_on)
++  const friendOpen  = (dashboard?.rewards ?? []).filter(r => r.reward.reward_type === 'FRIEND_10_OFF' && !r.reward.coupon_id && !r.reward.used_at)
++
++  return (
++    <div className="min-h-screen bg-stone-50">
++      <Sidebar active="/dashboard/members" />
++      <div className="md:ml-56 pt-14 md:pt-0">
++        <div className="max-w-3xl mx-auto p-4 md:p-6 space-y-5">
++          <button onClick={() => router.push('/dashboard/members')} className="text-sm text-stone-500 hover:text-stone-700 flex items-center gap-1">
++            <ArrowLeft size={14} /> 返回会员列表
++          </button>
++
++          {loading && <div className="text-center py-12 text-stone-400">加载中…</div>}
++          {error && <p className="text-sm text-red-500 bg-red-50 border border-red-100 rounded-xl px-4 py-3">{error}</p>}
++          {notice && <p className="text-sm text-emerald-600 bg-emerald-50 border border-emerald-100 rounded-xl px-4 py-3">{notice}</p>}
++
++          {member && (
++            <>
++              {/* ── 身份 ─────────────────────────────────────────────── */}
++              <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-5 py-4 space-y-3">
++                <div className="flex items-start justify-between gap-3">
++                  <div>
++                    <h1 className="text-xl font-bold text-stone-800">{member.display_name ?? '（未填姓名）'}</h1>
++                    <p className="text-sm text-stone-500">{member.email}</p>
++                    <p className="text-xs text-stone-400 mt-1">加入于 {fmt(member.joined_at)}</p>
++                  </div>
++                  <button
++                    onClick={() => act(member.is_active ? 'disable' : 'enable', {}, 'active')}
++                    disabled={busy === 'active'}
++                    className={member.is_active
++                      ? 'px-3 py-1.5 rounded-xl border border-red-200 bg-red-50 text-red-500 text-xs font-medium hover:bg-red-100 transition shrink-0'
++                      : 'px-3 py-1.5 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-600 text-xs font-medium hover:bg-emerald-100 transition shrink-0'}
++                  >
++                    {busy === 'active' ? '处理中…' : member.is_active ? '停用会员' : '恢复会员'}
++                  </button>
++                </div>
++                <div className="flex gap-2">
++                  <input
++                    value={nameEdit}
++                    onChange={e => setNameEdit(e.target.value)}
++                    placeholder="会员姓名"
++                    className="flex-1 border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-terracotta/30"
++                  />
++                  <button
++                    onClick={async () => { if (await act('update_name', { display_name: nameEdit }, 'name')) setNotice('姓名已更新') }}
++                    disabled={busy === 'name'}
++                    className="px-4 py-2 rounded-xl bg-stone-800 text-white text-sm font-medium hover:bg-stone-700 disabled:opacity-50 transition shrink-0"
++                  >
++                    {busy === 'name' ? '保存中…' : '保存姓名'}
++                  </button>
++                </div>
++                <p className="text-xs text-stone-400">邮箱不提供修改（PRD 2.2）。姓名由会员自己也能改。</p>
++              </div>
++
++              {/* ── 进度 ─────────────────────────────────────────────── */}
++              {dashboard && (
++                <MemberProgressBar
++                  cells={dashboard.progress_cells}
++                  cycleProgress={dashboard.cycle_progress}
++                  nextReward={dashboard.next_reward}
++                  lifetimeVisits={dashboard.lifetime_visits}
++                  lang="zh"
++                />
++              )}
++
++              {/* ── VIP Month ────────────────────────────────────────── */}
++              <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-5 py-4 space-y-3">
++                <h2 className="text-sm font-semibold text-stone-700 flex items-center gap-2"><Crown size={15} /> VIP Month</h2>
++                <p className="text-sm text-stone-600">
++                  {dashboard?.vip.active_expires_on
++                    ? `生效中，有效期至 ${dashboard.vip.active_expires_on}`
++                    : '当前没有生效中的 VIP Month'}
++                </p>
++                <p className="text-xs text-stone-400">
++                  未激活 {dashboard?.vip.ready_to_activate ?? 0} 张 · 已激活过 {dashboard?.vip.activated ?? 0} 张
++                  （同一时间只能有一张生效，到期后不会自动续）
++                </p>
++                {readyVip.length > 0 && (
++                  <button
++                    onClick={() => act('activate_vip', { reward_id: readyVip[0].reward.reward_id }, 'vip')}
++                    disabled={busy === 'vip' || Boolean(dashboard?.vip.active_expires_on)}
++                    className="px-4 py-2 rounded-xl bg-terracotta text-white text-sm font-medium hover:bg-terracotta/90 disabled:opacity-50 transition"
++                  >
++                    {busy === 'vip' ? '激活中…' : '代为激活这张 VIP Month'}
++                  </button>
++                )}
++              </div>
++
++              {/* ── 奖励 ─────────────────────────────────────────────── */}
++              <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-5 py-4 space-y-3">
++                <h2 className="text-sm font-semibold text-stone-700 flex items-center gap-2"><Gift size={15} /> 奖励与记录</h2>
++                <ul className="space-y-2">
++                  {(dashboard?.rewards ?? []).map((entry: MemberRewardEntry) => (
++                    <li key={entry.reward.reward_id} className="rounded-xl border border-stone-100 px-3 py-2">
++                      <div className="flex items-center justify-between gap-2">
++                        <span className="text-sm text-stone-700">{rewardLabels[entry.reward.reward_type]}</span>
++                        <span className="text-xs text-stone-500">{stateLabels[entry.state] ?? entry.state}</span>
++                      </div>
++                      <p className="text-xs text-stone-400 mt-0.5">
++                        第 {entry.cycle_index} 轮 · {fmt(entry.reward.unlocked_at)} 解锁
++                        {entry.reward.used_at && ` · ${fmt(entry.reward.used_at)} 使用`}
++                        {entry.benefit?.activated_on && ` · VIP ${entry.benefit.activated_on} 至 ${entry.benefit.expires_on}`}
++                        {entry.coupon_code && ` · 内部券 ${entry.coupon_code}`}
++                      </p>
++                    </li>
++                  ))}
++                  {(dashboard?.rewards ?? []).length === 0 && <li className="text-sm text-stone-400">还没有解锁奖励。</li>}
++                </ul>
++
++                {friendOpen.length > 0 && (
++                  <div className="rounded-xl border border-stone-100 bg-stone-50 px-3 py-3 space-y-2">
++                    <p className="text-xs text-stone-500">
++                      转赠朋友 9 折：先在优惠券页生成一张 10% OFF 的普通券，再把券码填在这里关联。关联后这张奖励不能再直接使用。
++                    </p>
++                    <div className="flex gap-2">
++                      <input
++                        value={couponFor === friendOpen[0].reward.reward_id ? couponCode : ''}
++                        onChange={e => { setCouponFor(friendOpen[0].reward.reward_id); setCouponCode(e.target.value.toUpperCase()) }}
++                        placeholder="TDXXXXXXXX"
++                        className="flex-1 border border-stone-200 rounded-xl px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-terracotta/30"
++                      />
++                      <button
++                        onClick={async () => {
++                          const ok = await act('associate_friend_coupon', { reward_id: friendOpen[0].reward.reward_id, coupon_code: couponCode }, 'coupon')
++                          if (ok) { setNotice('已关联到该优惠券'); setCouponCode(''); setCouponFor('') }
++                        }}
++                        disabled={busy === 'coupon' || !couponCode.trim()}
++                        className="px-4 py-2 rounded-xl bg-stone-800 text-white text-sm font-medium hover:bg-stone-700 disabled:opacity-50 transition shrink-0"
++                      >
++                        {busy === 'coupon' ? '关联中…' : '关联优惠券'}
++                      </button>
++                    </div>
++                  </div>
++                )}
++              </div>
++
++              {/* ── 挂订单 ───────────────────────────────────────────── */}
++              <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-5 py-4 space-y-3">
++                <h2 className="text-sm font-semibold text-stone-700 flex items-center gap-2"><Link2 size={15} /> 把订单关联到该会员</h2>
++                <p className="text-xs text-stone-400">
++                  顾客开始计时时忘了以会员身份登录时用。只能挂**尚未结算**的订单；已经结算的要先撤销结算，否则等于绕过结算台账改数字。
++                </p>
++                <div className="flex gap-2">
++                  <input
++                    value={sessionId}
++                    onChange={e => setSessionId(e.target.value)}
++                    placeholder="计时订单号，如 PB-20260916-001"
++                    className="flex-1 border border-stone-200 rounded-xl px-3 py-2 text-sm font-mono focus:outline-none focus:ring-2 focus:ring-terracotta/30"
++                  />
++                  <button
++                    onClick={async () => {
++                      const ok = await act('link_session', { session_id: sessionId.trim() }, 'link')
++                      if (ok) { setNotice('订单已关联到该会员'); setSessionId('') }
++                    }}
++                    disabled={busy === 'link' || !sessionId.trim()}
++                    className="px-4 py-2 rounded-xl bg-stone-800 text-white text-sm font-medium hover:bg-stone-700 disabled:opacity-50 transition shrink-0"
++                  >
++                    {busy === 'link' ? '关联中…' : '关联'}
++                  </button>
++                </div>
++              </div>
++
++              {/* ── 到店记录 ─────────────────────────────────────────── */}
++              <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-5 py-4 space-y-3">
++                <h2 className="text-sm font-semibold text-stone-700">到店记录</h2>
++                <ul className="space-y-1.5">
++                  {(dashboard?.visit_history ?? []).map(v => (
++                    <li key={v.session_id} className="flex items-center justify-between text-sm border border-stone-100 rounded-xl px-3 py-2">
++                      <span className="text-stone-700">{v.visit_date}</span>
++                      <span className={v.counted_for_progress ? 'text-emerald-600 text-xs' : 'text-amber-600 text-xs'}>
++                        {v.progress_paused ? 'VIP 期间，进度暂停' : '计入进度'}
++                      </span>
++                    </li>
++                  ))}
++                  {(dashboard?.visit_history ?? []).length === 0 && <li className="text-sm text-stone-400">还没有已结算的到店记录。</li>}
++                </ul>
++              </div>
++
++              {/* ── 禁止动作 ─────────────────────────────────────────── */}
++              <div className="rounded-2xl border border-amber-100 bg-amber-50 px-5 py-4">
++                <p className="text-xs font-semibold text-amber-700 mb-1">后台不能做的事</p>
++                <p className="text-xs leading-5 text-amber-700">
++                  手动加减到店次数、直接改奖励进度、手动补发奖励、修改邮箱、删除到店或奖励历史。
++                  会员进度必须来自真实结算记录。金额也只在结算面板由服务端计算，后台改不了数字。
++                </p>
++              </div>
++            </>
++          )}
++        </div>
++      </div>
++    </div>
++  )
++}
+diff --git a/app/(admin)/dashboard/members/page.tsx b/app/(admin)/dashboard/members/page.tsx
+new file mode 100644
+index 0000000..a523cc0
+--- /dev/null
++++ b/app/(admin)/dashboard/members/page.tsx
+@@ -0,0 +1,115 @@
++'use client'
++
++// 后台会员列表（PRD 16.1）：按姓名或邮箱搜索，点进去看详情与操作。
++
++import { useEffect, useState } from 'react'
++import { useRouter } from 'next/navigation'
++import { Search, Users } from 'lucide-react'
++import Sidebar from '@/components/admin/Sidebar'
++
++interface MemberListItem {
++  member_id:       string
++  email:           string
++  display_name:    string | null
++  joined_at:       string
++  is_active:       boolean
++  lifetime_visits: number
++  reward_progress: number
++}
++
++export default function MembersPage() {
++  const router = useRouter()
++  const [members, setMembers] = useState<MemberListItem[]>([])
++  const [search, setSearch]   = useState('')
++  const [loading, setLoading] = useState(true)
++  const [error, setError]     = useState('')
++
++  async function load(q = '') {
++    setLoading(true)
++    setError('')
++    try {
++      const res  = await fetch(`/api/admin/members?search=${encodeURIComponent(q)}`)
++      const data = await res.json() as MemberListItem[] | { error?: string }
++      if (!res.ok) { setError((data as { error?: string }).error ?? '读取失败'); setMembers([]); return }
++      setMembers(data as MemberListItem[])
++    } catch {
++      setError('网络错误，请重试')
++    } finally {
++      setLoading(false)
++    }
++  }
++
++  useEffect(() => { load() }, []) // eslint-disable-line react-hooks/exhaustive-deps
++
++  return (
++    <div className="min-h-screen bg-stone-50">
++      <Sidebar active="/dashboard/members" />
++      <div className="md:ml-56 pt-14 md:pt-0">
++        <div className="max-w-3xl mx-auto p-4 md:p-6 space-y-6">
++          <div className="flex items-center justify-between">
++            <h1 className="text-xl font-bold text-stone-800 flex items-center gap-2">
++              <Users size={18} /> Tangdouren Club 会员
++            </h1>
++            <span className="text-xs text-stone-400">共 {members.length} 位</span>
++          </div>
++
++          <div className="bg-white rounded-2xl border border-stone-100 shadow-sm px-5 py-4">
++            <div className="flex gap-2">
++              <input
++                value={search}
++                onChange={e => setSearch(e.target.value)}
++                onKeyDown={e => e.key === 'Enter' && load(search)}
++                placeholder="按姓名或邮箱搜索"
++                className="flex-1 border border-stone-200 rounded-xl px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-terracotta/30"
++              />
++              <button
++                onClick={() => load(search)}
++                className="px-4 py-2 bg-terracotta text-white rounded-xl text-sm font-medium hover:bg-terracotta/90 transition flex items-center gap-1.5"
++              >
++                <Search size={14} /> 搜索
++              </button>
++            </div>
++            <p className="text-xs text-stone-400 mt-2">
++              * 会员进度由真实结算记录派生，后台不能手动加减次数或补发奖励。
++            </p>
++          </div>
++
++          {error && <p className="text-sm text-red-500 bg-red-50 border border-red-100 rounded-xl px-4 py-3">{error}</p>}
++
++          {loading ? (
++            <div className="text-center py-12 text-stone-400">加载中…</div>
++          ) : members.length === 0 ? (
++            <div className="text-center py-12 text-stone-400">
++              <p className="text-3xl mb-2">👥</p>
++              <p>{search ? '没有匹配的会员' : '还没有会员'}</p>
++            </div>
++          ) : (
++            <div className="space-y-2">
++              {members.map(m => (
++                <button
++                  key={m.member_id}
++                  onClick={() => router.push(`/dashboard/members/${m.member_id}`)}
++                  className="w-full flex items-center justify-between bg-white rounded-2xl border border-stone-100 px-4 py-3 text-left hover:border-terracotta/30 hover:shadow-sm transition"
++                >
++                  <div className="min-w-0">
++                    <div className="flex items-center gap-2 mb-0.5">
++                      <span className="font-medium text-stone-800 text-sm truncate">{m.display_name ?? '（未填姓名）'}</span>
++                      {!m.is_active && (
++                        <span className="text-xs px-2 py-0.5 rounded-full bg-stone-100 text-stone-500 font-medium shrink-0">已停用</span>
++                      )}
++                    </div>
++                    <p className="text-xs text-stone-400 truncate">{m.email}</p>
++                  </div>
++                  <div className="text-right shrink-0 ml-3">
++                    <p className="text-xs text-stone-500">累计到店 <span className="font-semibold text-stone-700">{m.lifetime_visits}</span> 次</p>
++                    <p className="text-xs text-stone-400">计入进度 {m.reward_progress} 次</p>
++                  </div>
++                </button>
++              ))}
++            </div>
++          )}
++        </div>
++      </div>
++    </div>
++  )
++}
+diff --git a/app/(admin)/dashboard/timers/[id]/page.tsx b/app/(admin)/dashboard/timers/[id]/page.tsx
+index 4d20966..8bc27b5 100644
+--- a/app/(admin)/dashboard/timers/[id]/page.tsx
++++ b/app/(admin)/dashboard/timers/[id]/page.tsx
+@@ -4,6 +4,7 @@ import { useEffect, useState, useRef, useCallback } from 'react'
+ import { useParams, useRouter } from 'next/navigation'
+ import { formatHMS, formatChineseDuration, calcBillingMinutes, calcBill, TIMER_PRICING } from '@/lib/timer/pricing'
+ import { describeDiscount, type DiscountType } from '@/lib/coupon/coupon'
++import { computeMemberDiscount, type DiscountSource, type RewardType } from '@/lib/member/member'
+ 
+ interface TimerSession {
+   session_id:         string
+@@ -30,6 +31,7 @@ interface TimerSession {
+   settlement_note:    string | null
+   settled_at:         string | null
+   settled_by:         string | null
++  reward_eligible:    boolean | null
+   // 优惠券快照字段
+   coupon_id:                  string | null
+   coupon_code_snapshot:       string | null
+@@ -50,6 +52,24 @@ interface CouponPreview {
+   discountAmountPence: number
+ }
+ 
++// 结算台需要的那一小块会员信息（由 GET /api/admin/timers/[id] 一并返回）
++interface MemberSettleInfo {
++  member_id:           string
++  display_name:        string | null
++  email:               string
++  vip_active:          boolean
++  vip_expires_on:      string | null
++  usable_reward_types: RewardType[]
++}
++
++const memberRewardLabels: Record<RewardType, string> = {
++  TWO_POUND:       '£2 抵用券',
++  FIVE_POUND:      '£5 抵用券',
++  PERSONAL_15_OFF: '本人 85 折',
++  FRIEND_10_OFF:   '朋友 9 折',
++  VIP_MONTH:       'VIP Month',
++}
++
+ function calcElapsed(session: TimerSession): number {
+   if (session.status === 'idle') return 0
+   if (session.status === 'completed' && session.elapsed_minutes !== null) return session.elapsed_minutes * 60
+@@ -66,6 +86,7 @@ export default function AdminTimerDetailPage() {
+   const { id }                = useParams<{ id: string }>()
+   const router                = useRouter()
+   const [session, setSession] = useState<TimerSession | null>(null)
++  const [member, setMember]   = useState<MemberSettleInfo | null>(null)
+   const [elapsed, setElapsed] = useState(0)
+   const [loading, setLoading] = useState(true)
+   const [acting, setActing]   = useState(false)
+@@ -76,8 +97,9 @@ export default function AdminTimerDetailPage() {
+   const fetchSession = useCallback(async () => {
+     const res  = await fetch(`/api/admin/timers/${id}`)
+     if (!res.ok) { setError('找不到计时订单'); setLoading(false); return }
+-    const data = await res.json() as { session: TimerSession }
++    const data = await res.json() as { session: TimerSession; member?: MemberSettleInfo | null }
+     setSession(data.session)
++    setMember(data.member ?? null)
+     setTableEdit(data.session.table_number ?? '')
+     setElapsed(calcElapsed(data.session))
+     setLoading(false)
+@@ -307,7 +329,7 @@ export default function AdminTimerDetailPage() {
+ 
+       {/* Settlement */}
+       {isCompleted && (
+-        <SettlementPanel session={session} onSettled={fetchSession} />
++        <SettlementPanel session={session} member={member} onSettled={fetchSession} />
+       )}
+ 
+       {/* Live bill preview (running) */}
+@@ -367,13 +389,30 @@ export default function AdminTimerDetailPage() {
+ 
+ // ── 结算面板 ─────────────────────────────────────────────────────────────────
+ // 金额一律由服务端计算：优惠码只做预验证预览，确认结算时服务端重新校验并原子核销。
+-function SettlementPanel({ session, onSettled }: { session: TimerSession; onSettled: () => void }) {
+-  const [code,      setCode]      = useState('')
+-  const [preview,   setPreview]   = useState<CouponPreview | null>(null)
+-  const [note,      setNote]      = useState(session.settlement_note ?? '')
+-  const [verifying, setVerifying] = useState(false)
+-  const [saving,    setSaving]    = useState(false)
+-  const [error,     setError]     = useState('')
++function SettlementPanel({ session, member, onSettled }: { session: TimerSession; member: MemberSettleInfo | null; onSettled: () => void }) {
++  const [code,       setCode]       = useState('')
++  const [preview,    setPreview]    = useState<CouponPreview | null>(null)
++  const [note,       setNote]       = useState(session.settlement_note ?? '')
++  const [verifying,  setVerifying]  = useState(false)
++  const [saving,     setSaving]     = useState(false)
++  const [error,      setError]      = useState('')
++  const [rewardType, setRewardType] = useState<RewardType | null>(null)
++
++  // VIP 生效期间系统强制走 VIP 85 折，店员不能改用其他会员奖励（PRD 11.4）
++  const vipActive = Boolean(member?.vip_active)
++
++  /** 会员折扣的预览。金额规则与数据库复核用的是同一套（lib/member/member.ts） */
++  const memberPreview = (() => {
++    if (!member) return null
++    const effective: DiscountSource = vipActive ? 'vip_month' : rewardType ? 'member_reward' : 'none'
++    if (effective === 'none') return null
++    const computed = computeMemberDiscount(effective, {
++      amountGbp:  session.amount_gbp,
++      vipActive,
++      rewardType,
++    })
++    return computed.ok ? computed.preview : null
++  })()
+ 
+   const inputCls = 'w-full rounded-xl border border-stone-200 bg-stone-50 px-3 py-2 text-sm text-stone-800 focus:outline-none focus:ring-2 focus:ring-terracotta/30 focus:border-terracotta'
+   const money    = (n: number | null | undefined) => n === null || n === undefined ? '—' : `£${n.toFixed(2)}`
+@@ -413,6 +452,18 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+               </div>
+             </>
+           )}
++          {member && (
++            <div className="flex justify-between">
++              <span className="text-stone-500">会员</span>
++              <span className="font-medium text-stone-700">{member.display_name ?? member.email}</span>
++            </div>
++          )}
++          {session.reward_eligible === false && (
++            <div className="flex justify-between">
++              <span className="text-stone-500">本次进度</span>
++              <span className="font-medium text-amber-700">VIP 期间，不计入 Reward Progress</span>
++            </div>
++          )}
+           <div className="flex justify-between pt-1.5 border-t border-emerald-200">
+             <span className="text-stone-500">实收</span>
+             <span className="font-bold text-emerald-700 text-base">{money(session.actual_amount_gbp)}</span>
+@@ -470,7 +521,15 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+   }
+ 
+   async function handleSettle() {
+-    if (code.trim() && !preview) { setError('请先点击「验证」确认优惠码'); return }
++    // 一次结算只能有一个折扣来源（PRD 21）
++    const effectiveSource: DiscountSource = vipActive
++      ? 'vip_month'
++      : rewardType
++        ? 'member_reward'
++        : code.trim() ? 'coupon' : 'none'
++
++    if (effectiveSource === 'coupon' && !preview) { setError('请先点击「验证」确认优惠码'); return }
++    if (effectiveSource === 'member_reward' && !memberPreview) { setError('该会员奖励当前不可用'); return }
+     setError('')
+     setSaving(true)
+     try {
+@@ -479,7 +538,9 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+         headers: { 'Content-Type': 'application/json' },
+         body: JSON.stringify({
+           action:          'settle',
+-          coupon_code:     code.trim() ? code.trim().toUpperCase() : undefined,
++          coupon_code:     effectiveSource === 'coupon' ? code.trim().toUpperCase() : undefined,
++          discount_source: effectiveSource,
++          reward_type:     effectiveSource === 'member_reward' ? rewardType : undefined,
+           settlement_note: note || null,
+         }),
+       })
+@@ -515,7 +576,7 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+   }
+ 
+   const originalGbp = session.amount_gbp ?? 0
+-  const finalGbp    = preview ? preview.finalGbp : originalGbp
++  const finalGbp    = preview ? preview.finalGbp : memberPreview ? memberPreview.finalGbp : originalGbp
+ 
+   return (
+     <div className="bg-white border border-stone-100 rounded-2xl px-5 py-4 shadow-sm">
+@@ -547,12 +608,63 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+             <span className="text-stone-600">{new Date(session.stopped_at).toLocaleString('zh-CN', { timeZone: 'Europe/London' })}</span>
+           </div>
+         )}
++        {member && (
++          <div className="flex justify-between text-stone-500">
++            <span>会员</span>
++            <span className="font-medium text-amber-700">{member.display_name ?? '（未填姓名）'} · {member.email}</span>
++          </div>
++        )}
+         <div className="flex justify-between pt-1.5 border-t border-stone-200">
+           <span className="font-semibold text-stone-600">系统原价</span>
+           <span className="font-bold text-stone-800 text-base">{money(originalGbp)}</span>
+         </div>
+       </div>
+ 
++      {member && (
++        <p className="text-xs text-amber-700 bg-amber-50 border border-amber-100 rounded-xl px-3 py-2 mb-4">
++          请核对柜台前的人与会员姓名一致。邮箱没有验证过，这一步是唯一的防线。
++        </p>
++      )}
++
++      {/* 会员优惠 */}
++      {member && (
++        <div className="mb-4">
++          <label className="block text-xs text-stone-400 mb-1">会员优惠</label>
++          {vipActive ? (
++            <div className="rounded-xl border border-terracotta/30 bg-terracotta/5 px-3 py-2 text-sm text-stone-700">
++              VIP Month 生效中{member.vip_expires_on ? `（至 ${member.vip_expires_on}）` : ''}，系统自动使用 85 折，
++              其他会员奖励暂时不可用。
++            </div>
++          ) : (
++            <div className="flex flex-wrap gap-2">
++              <button
++                onClick={() => { setRewardType(null); setError('') }}
++                className={rewardType === null
++                  ? 'px-3 py-1.5 rounded-xl bg-terracotta text-white text-sm font-medium'
++                  : 'px-3 py-1.5 rounded-xl border border-stone-200 bg-white text-stone-600 text-sm hover:border-terracotta/40'}
++              >
++                不使用会员奖励
++              </button>
++              {member.usable_reward_types.map(rt => (
++                <button
++                  key={rt}
++                  onClick={() => { setRewardType(rt); setCode(''); setPreview(null); setError('') }}
++                  className={rewardType === rt
++                    ? 'px-3 py-1.5 rounded-xl bg-terracotta text-white text-sm font-medium'
++                    : 'px-3 py-1.5 rounded-xl border border-stone-200 bg-white text-stone-600 text-sm hover:border-terracotta/40'}
++                >
++                  {memberRewardLabels[rt]}
++                </button>
++              ))}
++            </div>
++          )}
++          {!vipActive && member.usable_reward_types.length === 0 && (
++            <p className="mt-1 text-xs text-stone-400">该会员当前没有可用的奖励。</p>
++          )}
++          <p className="mt-1 text-xs text-stone-400">同类多张时系统自动核销最早解锁的一张；刚解锁的奖励要下一次消费才能用。</p>
++        </div>
++      )}
++
+       {/* 优惠码 */}
+       <div className="mb-4">
+         <label className="block text-xs text-stone-400 mb-1">优惠码（可选）</label>
+@@ -560,13 +672,14 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+           <input
+             className={inputCls + ' font-mono'}
+             placeholder="TDXXXXXXXX"
++            disabled={vipActive || rewardType !== null}
+             value={code}
+             onChange={e => { setCode(e.target.value.toUpperCase()); setPreview(null); setError('') }}
+             onKeyDown={e => e.key === 'Enter' && handleVerify()}
+           />
+           <button
+             onClick={handleVerify}
+-            disabled={verifying || !code.trim()}
++            disabled={verifying || !code.trim() || vipActive || rewardType !== null}
+             className="px-4 py-2 rounded-xl bg-stone-800 text-white text-sm font-medium hover:bg-stone-700 disabled:opacity-50 transition shrink-0"
+           >
+             {verifying ? '验证中…' : '验证'}
+@@ -576,6 +689,19 @@ function SettlementPanel({ session, onSettled }: { session: TimerSession; onSett
+       </div>
+ 
+       {/* 优惠预览 */}
++      {memberPreview && !preview && (
++        <div className="bg-terracotta/5 border border-terracotta/20 rounded-xl px-4 py-3 mb-4 text-sm space-y-1.5">
++          <div className="flex justify-between">
++            <span className="text-stone-500">会员优惠</span>
++            <span className="font-medium text-terracotta">{memberPreview.description}</span>
++          </div>
++          <div className="flex justify-between">
++            <span className="text-stone-500">优惠金额</span>
++            <span className="font-medium text-terracotta">−{money(memberPreview.discountGbp)}</span>
++          </div>
++        </div>
++      )}
++
+       {preview && (
+         <div className="bg-terracotta/5 border border-terracotta/20 rounded-xl px-4 py-3 mb-4 text-sm space-y-1.5">
+           <div className="flex justify-between">
+diff --git a/app/(admin)/dashboard/timers/page.tsx b/app/(admin)/dashboard/timers/page.tsx
+index 79f6a29..25b08cd 100644
+--- a/app/(admin)/dashboard/timers/page.tsx
++++ b/app/(admin)/dashboard/timers/page.tsx
+@@ -18,6 +18,7 @@ interface TimerSession {
+   booking_id:      string | null
+   table_number:    string | null
+   created_via:     'admin' | 'booking' | 'self_service' | null
++  member?:         { display_name: string | null; email: string } | null
+ }
+ 
+ function calcLiveElapsed(s: TimerSession): number {
+@@ -225,6 +226,11 @@ export default function TimersListPage() {
+                               {s.table_number}
+                             </span>
+                           )}
++                          {s.member && (
++                            <span className="text-xs px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 font-medium shrink-0 truncate max-w-[9rem]">
++                              {s.member.display_name ?? s.member.email}
++                            </span>
++                          )}
+                           <span className={`text-xs px-2 py-0.5 rounded-full font-medium shrink-0 ${meta.color}`}>
+                             {meta.label}
+                           </span>
+diff --git a/app/(site)/booking/page.tsx b/app/(site)/booking/page.tsx
+index 3f199c4..9fd2bfd 100644
+--- a/app/(site)/booking/page.tsx
++++ b/app/(site)/booking/page.tsx
+@@ -98,7 +98,8 @@ export default function BookingPage() {
+   const [selectedOption, setSelectedOption] = useState<{
+     startTime: string; durationMinutes: number; displayTag: string
+   } | null>(null)
+-  const [form, setForm]         = useState({ name: '', email: '', remark: '' })
++  const [form, setForm]         = useState({ name: '', email: '', remark: '', joinClub: false })
++  const [memberJoined, setMemberJoined] = useState(false)
+   const [formErrors, setErrors] = useState<Record<string, string>>({})
+   const [submitting, setSubmitting] = useState(false)
+   const [submitError, setSubmitError] = useState('')
+@@ -207,11 +208,13 @@ export default function BookingPage() {
+           durationMinutes: selectedOption.durationMinutes,
+           customerName: form.name, email: form.email,
+           remark: form.remark || undefined,
++          joinClub: form.joinClub,
+           lang,
+         }),
+       })
+       const bookingData = await bookingRes.json()
+       if (!bookingRes.ok) { setSubmitError(bookingData.error ?? p(t.step4NetworkErr)); return }
++      setMemberJoined(Boolean(bookingData.memberJoined))
+ 
+       setBookingResult({
+         bookingId: bookingData.bookingId,
+@@ -246,7 +249,7 @@ export default function BookingPage() {
+   function resetAll() {
+     setStep('date'); setDate(null); setPartySize(1); setSharing(false)
+     setPickedTime(null); setAvailability([]); setSelectedOption(null)
+-    setForm({ name: '', email: '', remark: '' })
++    setForm({ name: '', email: '', remark: '', joinClub: false })
+     setErrors({}); setSubmitError(''); setBookingResult(null)
+   }
+ 
+@@ -634,6 +637,19 @@ export default function BookingPage() {
+                     {formErrors.email && <p className="mt-1 text-xs text-red-500">{formErrors.email}</p>}
+                   </div>
+ 
++                  <label className="flex items-start gap-3 rounded-2xl border border-sand-200 bg-warm-50 p-4">
++                    <input
++                      type="checkbox"
++                      className="mt-1"
++                      checked={form.joinClub}
++                      onChange={e => setForm({ ...form, joinClub: e.target.checked })}
++                    />
++                    <span>
++                      <span className="block text-sm font-medium text-charcoal">{p(t.step4JoinClub)}</span>
++                      <span className="mt-1 block text-xs leading-5 text-charcoal-light">{p(t.step4JoinClubHint)}</span>
++                    </span>
++                  </label>
++
+                   <div>
+                     <label className="label" htmlFor="remark">{p(t.step4RemarkLabel)}</label>
+                     <textarea id="remark" rows={3}
+@@ -685,6 +701,12 @@ export default function BookingPage() {
+             <p className="text-charcoal-light mb-2">{p(t.step5Subtitle)}</p>
+             <p className="text-sm text-charcoal-light/60 mb-8">{p(t.step5SubNote)}</p>
+ 
++            {memberJoined && (
++              <div className="rounded-2xl bg-sage/10 border border-sage/30 px-4 py-3 text-sm text-charcoal mb-4">
++                {p(t.step5MemberJoined)}
++              </div>
++            )}
++
+             <div className="rounded-2xl bg-warm-50 border border-sand-200 p-4 text-sm text-left space-y-2 mb-6">
+               <p className="font-semibold text-charcoal mb-2">{p(t.step5DetailsTitle)}</p>
+               <p className="text-xs text-charcoal-light/70">{p(t.step5Ref)}{bookingResult.bookingId.slice(0, 8)}…</p>
+diff --git a/app/(site)/self-timer/club/page.tsx b/app/(site)/self-timer/club/page.tsx
+new file mode 100644
+index 0000000..a35ff63
+--- /dev/null
++++ b/app/(site)/self-timer/club/page.tsx
+@@ -0,0 +1,327 @@
++'use client'
++
++// 会员首页（PRD 12、13、14）：同页展示进度、奖励、到店记录与奖励历史，不拆成二级入口。
++
++import { useCallback, useEffect, useState } from 'react'
++import { useRouter } from 'next/navigation'
++import { ArrowLeft, CalendarCheck, Crown, Gift, History, Sparkles } from 'lucide-react'
++import { useLanguage } from '@/lib/i18n/LanguageContext'
++import MemberProgressBar from '@/components/member/MemberProgressBar'
++import { forgetMember, readRememberedMember } from '@/lib/member/client'
++import type { MemberDashboard, MemberRewardEntry, MemberVisitEntry } from '@/lib/member/service'
++import type { RewardType } from '@/lib/member/member'
++
++const copy = {
++  zh: {
++    title:        'Tangdouren Club',
++    hi:           (name: string) => `你好，${name}`,
++    loading:      '正在读取会员信息…',
++    startAsMember:'以会员身份开始计时',
++    myRewards:    '我的奖励',
++    recentVisits: '最近到店',
++    rewardHistory:'奖励记录',
++    viewAll:      '查看全部',
++    collapse:     '收起',
++    noRewards:    '还没有解锁奖励，计满 2 次就能拿到第一张 £2 抵用券。',
++    noVisits:     '还没有可显示的到店记录。',
++    notMember:    '这台设备上没有记住会员身份。',
++    backToTimer:  '回到首页',
++    switchAccount:'切换账户',
++    vipActive:    (date: string) => `VIP Month 生效中，有效期至 ${date}`,
++    vipReady:     (n: number) => `你有 ${n} 张未激活的 VIP Month`,
++    vipHint:      '激活后 30 天内每次计时自动享受 85 折，期间其他奖励暂时不可用但不会过期。',
++    vipActivate:  '立即激活',
++    vipActivating:'激活中…',
++    vipActivated: '已激活',
++    vipNone:      '累计 10 次到店解锁 VIP Month',
++    rewardNames: {
++      TWO_POUND:       '£2 抵用券',
++      FIVE_POUND:      '£5 抵用券',
++      PERSONAL_15_OFF: '本人 85 折',
++      FRIEND_10_OFF:   '朋友 9 折',
++      VIP_MONTH:       'VIP Month',
++    } as Record<RewardType, string>,
++    states: {
++      available:      '可用',
++      used:           '已使用',
++      paused_by_vip:  'VIP 结束后可用',
++      transferred:    '已转赠给朋友',
++    },
++    progressCounted: '计入进度',
++    progressPaused:  'VIP 期间，进度暂停',
++    usedReward:      (name: string) => `使用了${name}`,
++    usedVip:         '使用 VIP 85 折',
++    noRewardUsed:    '未使用会员优惠',
++    unlockedOn:      (d: string) => `${d} 解锁`,
++    usedOn:          (d: string) => `${d} 使用`,
++  },
++  en: {
++    title:        'Tangdouren Club',
++    hi:           (name: string) => `Hi ${name}`,
++    loading:      'Loading your membership…',
++    startAsMember:'Start as Member',
++    myRewards:    'My Rewards',
++    recentVisits: 'Recent Visits',
++    rewardHistory:'Reward History',
++    viewAll:      'View all',
++    collapse:     'Show less',
++    noRewards:    'No rewards yet — two visits unlock your first £2 voucher.',
++    noVisits:     'No visits to show yet.',
++    notMember:    'This device does not remember a membership.',
++    backToTimer:  'Back to home',
++    switchAccount:'Use another account',
++    vipActive:    (date: string) => `VIP Month active until ${date}`,
++    vipReady:     (n: number) => `You have ${n} VIP Month ready to activate`,
++    vipHint:      'Activate it and every timer session is 15% off for 30 days. Other rewards stay available after it ends.',
++    vipActivate:  'Activate now',
++    vipActivating:'Activating…',
++    vipActivated: 'Activated',
++    vipNone:      'Reach 10 visits to unlock VIP Month',
++    rewardNames: {
++      TWO_POUND:       '£2 Voucher',
++      FIVE_POUND:      '£5 Voucher',
++      PERSONAL_15_OFF: '15% OFF for you',
++      FRIEND_10_OFF:   '10% OFF for a friend',
++      VIP_MONTH:       'VIP Month',
++    } as Record<RewardType, string>,
++    states: {
++      available:      'Available',
++      used:           'Used',
++      paused_by_vip:  'Available after VIP Month',
++      transferred:    'Given to a friend',
++    },
++    progressCounted: 'Counted',
++    progressPaused:  'Progress paused during VIP',
++    usedReward:      (name: string) => `Used ${name}`,
++    usedVip:         'Used VIP 15% off',
++    noRewardUsed:    'No member discount',
++    unlockedOn:      (d: string) => `Unlocked ${d}`,
++    usedOn:          (d: string) => `Used ${d}`,
++  },
++} as const
++
++function dateOf(iso: string | null): string {
++  return iso ? iso.slice(0, 10) : ''
++}
++
++export default function ClubPage() {
++  const router = useRouter()
++  const { lang } = useLanguage()
++  const c = copy[lang]
++
++  const [dashboard, setDashboard] = useState<MemberDashboard | null>(null)
++  const [loading, setLoading]     = useState(true)
++  const [error, setError]         = useState('')
++  const [activating, setActivating] = useState('')
++  const [showAllVisits, setShowAllVisits] = useState(false)
++  const [showAllHistory, setShowAllHistory] = useState(false)
++
++  const load = useCallback(async () => {
++    const remembered = readRememberedMember()
++    if (!remembered) { setLoading(false); return }
++
++    try {
++      const res = await fetch('/api/member/dashboard', {
++        method:  'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body:    JSON.stringify({ email: remembered.email, visitLimit: 50 }),
++      })
++      const data = await res.json().catch(() => ({})) as { dashboard?: MemberDashboard; error?: string }
++      if (!res.ok || !data.dashboard) { setError(data.error ?? c.loading); return }
++      setDashboard(data.dashboard)
++    } catch {
++      setError(c.loading)
++    } finally {
++      setLoading(false)
++    }
++  }, [c.loading])
++
++  useEffect(() => { void load() }, [load])
++
++  async function activateVip(rewardId: string) {
++    const remembered = readRememberedMember()
++    if (!remembered) return
++    setActivating(rewardId)
++    setError('')
++    try {
++      const res = await fetch('/api/member/activate-vip', {
++        method:  'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body:    JSON.stringify({ email: remembered.email, reward_id: rewardId }),
++      })
++      const data = await res.json().catch(() => ({})) as { error?: string }
++      if (!res.ok) { setError(data.error ?? c.vipActivated); return }
++      await load()
++    } finally {
++      setActivating('')
++    }
++  }
++
++  function switchAccount() {
++    forgetMember()
++    router.push('/self-timer')
++  }
++
++  const memberName  = dashboard?.member.display_name ?? ''
++  const readyVip    = (dashboard?.rewards ?? []).filter(r => r.reward.reward_type === 'VIP_MONTH' && !r.benefit?.activated_on)
++  const visitRows   = dashboard?.visit_history ?? []
++  const rewardRows  = dashboard?.rewards ?? []
++
++  return (
++    <div className="min-h-screen bg-gradient-to-br from-cream-100 via-orange-50 to-rose-50 px-4 pb-24 pt-24">
++      <div className="mx-auto max-w-md space-y-4">
++        <button onClick={() => router.push('/self-timer')} className="btn-ghost text-sm">
++          <ArrowLeft size={14} /> {c.backToTimer}
++        </button>
++
++        <div className="text-center">
++          <span className="inline-flex items-center gap-1 rounded-full bg-white/80 px-3 py-1 text-xs font-semibold text-terracotta shadow-sm">
++            <Sparkles size={12} /> {c.title}
++          </span>
++          <h1 className="mt-4 font-display text-3xl font-semibold text-charcoal">
++            {memberName ? c.hi(memberName) : c.title}
++          </h1>
++          {dashboard && <p className="mt-1 text-xs text-charcoal-light">{dashboard.member.email_masked}</p>}
++        </div>
++
++        {loading && <div className="card p-5 text-center text-sm text-charcoal-light">{c.loading}</div>}
++
++        {!loading && !dashboard && (
++          <div className="card space-y-3 p-5">
++            <p className="text-sm text-charcoal-light">{c.notMember}</p>
++            <button className="btn-primary w-full" onClick={() => router.push('/self-timer')}>{c.backToTimer}</button>
++          </div>
++        )}
++
++        {dashboard && (
++          <>
++            <MemberProgressBar
++              cells={dashboard.progress_cells}
++              cycleProgress={dashboard.cycle_progress}
++              nextReward={dashboard.next_reward}
++              lifetimeVisits={dashboard.lifetime_visits}
++              lang={lang}
++            />
++
++            <button className="btn-primary w-full py-3.5 text-base" onClick={() => router.push('/self-timer')}>
++              {c.startAsMember}
++            </button>
++
++            {/* ── VIP Month ─────────────────────────────────────────────── */}
++            <div className="card space-y-3 p-5">
++              <div className="flex items-center gap-2">
++                <Crown size={16} className="text-terracotta" />
++                <h2 className="font-display text-lg font-semibold text-charcoal">VIP Month</h2>
++              </div>
++              {dashboard.vip.active_expires_on
++                ? <p className="text-sm text-charcoal">{c.vipActive(dashboard.vip.active_expires_on)}</p>
++                : readyVip.length > 0
++                  ? (
++                    <>
++                      <p className="text-sm text-charcoal">{c.vipReady(readyVip.length)}</p>
++                      <p className="text-xs leading-5 text-charcoal-light">{c.vipHint}</p>
++                      <button
++                        className="btn-primary w-full"
++                        disabled={activating !== ''}
++                        onClick={() => activateVip(readyVip[0].reward.reward_id)}
++                      >
++                        {activating ? c.vipActivating : c.vipActivate}
++                      </button>
++                    </>
++                  )
++                  : <p className="text-sm text-charcoal-light">{c.vipNone}</p>}
++            </div>
++
++            {/* ── My Rewards（PRD 13.1）────────────────────────────────── */}
++            <div className="card space-y-3 p-5">
++              <div className="flex items-center gap-2">
++                <Gift size={16} className="text-terracotta" />
++                <h2 className="font-display text-lg font-semibold text-charcoal">{c.myRewards}</h2>
++              </div>
++              {rewardRows.length === 0 && <p className="text-sm text-charcoal-light">{c.noRewards}</p>}
++              <ul className="space-y-2">
++                {rewardRows.map(entry => (
++                  <li key={entry.reward.reward_id} className="flex items-center justify-between gap-3 rounded-2xl border border-sand-100 bg-white px-3 py-2">
++                    <span className="text-sm text-charcoal">{c.rewardNames[entry.reward.reward_type]}</span>
++                    <span className={`text-xs ${entry.state === 'available' ? 'text-sage' : 'text-charcoal-light'}`}>
++                      {c.states[entry.state]}
++                    </span>
++                  </li>
++                ))}
++              </ul>
++            </div>
++
++            {/* ── Recent Visits（PRD 14）──────────────────────────────── */}
++            <div className="card space-y-3 p-5">
++              <div className="flex items-center gap-2">
++                <CalendarCheck size={16} className="text-terracotta" />
++                <h2 className="font-display text-lg font-semibold text-charcoal">{c.recentVisits}</h2>
++              </div>
++              {visitRows.length === 0 && <p className="text-sm text-charcoal-light">{c.noVisits}</p>}
++              <ul className="space-y-2">
++                {(showAllVisits ? visitRows : visitRows.slice(0, 5)).map((visit: MemberVisitEntry) => (
++                  <li key={visit.session_id} className="rounded-2xl border border-sand-100 bg-white px-3 py-2">
++                    <div className="flex items-center justify-between">
++                      <span className="text-sm text-charcoal">{visit.visit_date}</span>
++                      <span className={`text-xs ${visit.counted_for_progress ? 'text-sage' : 'text-charcoal-light'}`}>
++                        {visit.progress_paused ? c.progressPaused : c.progressCounted}
++                      </span>
++                    </div>
++                    <p className="mt-0.5 text-xs text-charcoal-light">
++                      {visit.used_vip
++                        ? c.usedVip
++                        : visit.used_reward
++                          ? c.usedReward(c.rewardNames[visit.used_reward])
++                          : c.noRewardUsed}
++                    </p>
++                  </li>
++                ))}
++              </ul>
++              {visitRows.length > 5 && (
++                <button className="btn-ghost w-full text-sm" onClick={() => setShowAllVisits(v => !v)}>
++                  {showAllVisits ? c.collapse : c.viewAll}
++                </button>
++              )}
++            </div>
++
++            {/* ── Reward History（PRD 13.2）────────────────────────────── */}
++            <div className="card space-y-3 p-5">
++              <div className="flex items-center gap-2">
++                <History size={16} className="text-terracotta" />
++                <h2 className="font-display text-lg font-semibold text-charcoal">{c.rewardHistory}</h2>
++              </div>
++              <ul className="space-y-2">
++                {(showAllHistory ? rewardRows : rewardRows.slice(0, 5)).map((entry: MemberRewardEntry) => (
++                  <li key={entry.reward.reward_id} className="rounded-2xl border border-sand-100 bg-white px-3 py-2">
++                    <div className="flex items-center justify-between">
++                      <span className="text-sm text-charcoal">{c.rewardNames[entry.reward.reward_type]}</span>
++                      <span className="text-xs text-charcoal-light">{c.states[entry.state]}</span>
++                    </div>
++                    <p className="mt-0.5 text-xs text-charcoal-light">
++                      {c.unlockedOn(dateOf(entry.reward.unlocked_at))}
++                      {entry.reward.used_at && ` · ${c.usedOn(dateOf(entry.reward.used_at))}`}
++                      {entry.benefit?.activated_on && ` · ${c.vipActive(entry.benefit.expires_on ?? '')}`}
++                    </p>
++                  </li>
++                ))}
++              </ul>
++              {rewardRows.length > 5 && (
++                <button className="btn-ghost w-full text-sm" onClick={() => setShowAllHistory(v => !v)}>
++                  {showAllHistory ? c.collapse : c.viewAll}
++                </button>
++              )}
++            </div>
++          </>
++        )}
++
++        {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
++
++        {dashboard && (
++          <button className="btn-ghost w-full text-xs text-charcoal-light" onClick={switchAccount}>
++            {c.switchAccount}
++          </button>
++        )}
++      </div>
++    </div>
++  )
++}
+diff --git a/app/(site)/self-timer/page.tsx b/app/(site)/self-timer/page.tsx
+index 1313f96..7f00c2f 100644
+--- a/app/(site)/self-timer/page.tsx
++++ b/app/(site)/self-timer/page.tsx
+@@ -6,8 +6,10 @@ import { ZoomIn } from 'lucide-react'
+ import { useLanguage } from '@/lib/i18n/LanguageContext'
+ import { getSeatOptionsForTable, SELF_SERVICE_TABLE_CODES } from '@/lib/timer/selfServiceCore'
+ import ImageLightbox from '@/components/site/ImageLightbox'
++import { forgetMember, readRememberedMember, rememberMember, type RememberedMember } from '@/lib/member/client'
+ 
+-type Phase = 'home' | 'tutorial' | 'form' | 'confirm' | 'lookup'
++// club / join / signin 是会员入口（PRD 3.3、4）；lookup 一直是「找回我的计时」，两者别混
++type Phase = 'home' | 'tutorial' | 'form' | 'confirm' | 'lookup' | 'club' | 'join' | 'signin'
+ 
+ const SESSION_LS_KEY = 'tangdouren_self_timer_session_id'
+ 
+@@ -39,13 +41,33 @@ const copy = {
+     confirmStart: '确认并开始计时',
+     starting: '正在开始…',
+     contactStaff: '如需暂停或结束计时，请联系店员。',
+-    guestOnly: '本期为本次体验计时；暂不收集邮箱或累计会员时长。',
++    guestOnly: '不填邮箱也能直接开始计时，只是这一次不会计入会员进度。',
+     tapToZoom: '点击放大',
+     lookupTitle: '查询我的计时',
+     lookupHint: '选择开始计时时的座位号并填写名字，找回进行中的计时。',
+     lookupNamePlaceholder: '开始计时时填写的名字',
+     lookupSubmit: '查询',
+     lookupNotFound: '未找到进行中的计时，请检查座位号与名字是否正确。',
++    club: 'Tangdouren Club',
++    clubIntro: '每次到店计时都会累积进度，满 2 次就有 £2 抵用券，满 10 次解锁 VIP Month。',
++    clubWelcome: (name: string) => `欢迎回来，${name}`,
++    clubContinue: (name: string) => `继续以 ${name} 的身份`,
++    clubSwitch: '换一个账户',
++    clubForget: '忘记这台设备上的账户',
++    clubSignin: '我是会员',
++    clubJoin: '确认加入',
++    clubSigninTitle: '会员登录',
++    clubSigninHint: '输入注册时用的邮箱即可识别，不需要会员号。',
++    clubJoinTitle: '加入会员',
++    clubConsent: '我同意 Tangdouren Club 会员条款',
++    clubSubmitJoin: '加入会员',
++    clubSubmitSignin: '继续',
++    clubSubmitting: '处理中…',
++    clubEmailLabel: '邮箱',
++    clubNameLabel: '称呼',
++    clubJoinHint: '注册后不会自动开始计时，你可以在会员首页点「以会员身份开始计时」。',
++    memberStarting: (name: string) => `正在以 ${name} 的会员身份计时`,
++    memberStartHint: '已经是会员？以会员身份开始',
+   },
+   en: {
+     badge: 'In-store self timer',
+@@ -72,13 +94,33 @@ const copy = {
+     confirmStart: 'Confirm & Start Timer',
+     starting: 'Starting…',
+     contactStaff: 'Please contact staff if you need to pause or finish.',
+-    guestOnly: 'This version is for one-off session timing only. Email collection and member history are not enabled yet.',
++    guestOnly: 'You can start without an email — the visit simply will not count towards membership progress.',
+     tapToZoom: 'Tap to zoom',
+     lookupTitle: 'Find my timer',
+     lookupHint: 'Choose the seat number and enter the name you used when starting your timer.',
+     lookupNamePlaceholder: 'The name you entered',
+     lookupSubmit: 'Find',
+     lookupNotFound: 'No active timer found. Please check the seat number and name.',
++    club: 'Tangdouren Club',
++    clubIntro: 'Every in-store visit builds your progress. Two visits unlock a £2 voucher, ten unlock a VIP Month.',
++    clubWelcome: (name: string) => `Welcome back, ${name}`,
++    clubContinue: (name: string) => `Continue as ${name}`,
++    clubSwitch: 'Use another account',
++    clubForget: 'Forget this account',
++    clubSignin: "I'm a Member",
++    clubJoin: 'Join the Club',
++    clubSigninTitle: 'Member sign in',
++    clubSigninHint: 'Enter the email you registered with. There is no membership number.',
++    clubJoinTitle: 'Join the Club',
++    clubConsent: 'I agree to the Tangdouren Club membership terms',
++    clubSubmitJoin: 'Join Club',
++    clubSubmitSignin: 'Continue',
++    clubSubmitting: 'Working…',
++    clubEmailLabel: 'Email',
++    clubNameLabel: 'Name',
++    clubJoinHint: 'Joining does not start your timer — tap “Start as Member” on your member page when you are ready.',
++    memberStarting: (name: string) => `Timer will count towards ${name}'s membership`,
++    memberStartHint: 'Already a member? Start as Member',
+   },
+ } as const
+ 
+@@ -104,10 +146,16 @@ export default function SelfTimerPage() {
+   const [lookupTable, setLookupTable] = useState('')
+   const [lookupSeat, setLookupSeat] = useState('')
+   const [lookupName, setLookupName] = useState('')
++  const [member, setMember] = useState<RememberedMember | null>(null)
++  const [clubName, setClubName] = useState('')
++  const [clubEmail, setClubEmail] = useState('')
++  const [clubConsent, setClubConsent] = useState(false)
+   const idempotencyKey = useMemo(makeIdempotencyKey, [])
+ 
+   useEffect(() => {
+     try { setSavedSessionId(localStorage.getItem(SESSION_LS_KEY)) } catch {}
++    // 设备上记住的会员身份只用于少打一次邮箱，服务端每次都会重新查（PRD 4.3）
++    setMember(readRememberedMember())
+     void fetch('/api/self-timer/tables', { cache: 'no-store' })
+       .then(res => res.ok ? res.json() : null)
+       .then((data: { tables?: string[] } | null) => {
+@@ -130,7 +178,10 @@ export default function SelfTimerPage() {
+       const res = await fetch('/api/self-timer/start', {
+         method: 'POST',
+         headers: { 'Content-Type': 'application/json' },
+-        body: JSON.stringify({ tableNumber, seatNumber, customerName, confirmNoMixedBeans: true, idempotencyKey }),
++        body: JSON.stringify({
++          tableNumber, seatNumber, customerName, confirmNoMixedBeans: true, idempotencyKey,
++          memberEmail: member?.email,
++        }),
+       })
+       const data = await res.json() as { sessionId?: string; error?: string }
+       if (!res.ok || !data.sessionId) { setError(data.error ?? 'Start failed'); return }
+@@ -139,6 +190,53 @@ export default function SelfTimerPage() {
+     } finally { setLoading(false) }
+   }
+ 
++  async function joinClub() {
++    if (!clubName.trim()) { setError(lang === 'zh' ? '请填写称呼' : 'Please enter your name'); return }
++    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clubEmail.trim())) {
++      setError(lang === 'zh' ? '请输入有效的邮箱地址' : 'Please enter a valid email address')
++      return
++    }
++    if (!clubConsent) { setError(c.clubConsent); return }
++
++    setError('')
++    setLoading(true)
++    try {
++      const res = await fetch('/api/member/join', {
++        method:  'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body:    JSON.stringify({ name: clubName.trim(), email: clubEmail.trim(), consent: true }),
++      })
++      const data = await res.json().catch(() => ({})) as { member?: RememberedMember; error?: string }
++      if (!res.ok || !data.member) { setError(data.error ?? 'Join failed'); return }
++      const remembered = { ...data.member, email: clubEmail.trim() }
++      rememberMember(remembered)
++      setMember(remembered)
++      router.push('/self-timer/club')
++    } finally { setLoading(false) }
++  }
++
++  async function signinMember() {
++    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clubEmail.trim())) {
++      setError(lang === 'zh' ? '请输入有效的邮箱地址' : 'Please enter a valid email address')
++      return
++    }
++    setError('')
++    setLoading(true)
++    try {
++      const res = await fetch('/api/member/lookup', {
++        method:  'POST',
++        headers: { 'Content-Type': 'application/json' },
++        body:    JSON.stringify({ email: clubEmail.trim() }),
++      })
++      const data = await res.json().catch(() => ({})) as { member?: RememberedMember; error?: string }
++      if (!res.ok || !data.member) { setError(data.error ?? 'Not a member'); return }
++      const remembered = { ...data.member, email: clubEmail.trim() }
++      rememberMember(remembered)
++      setMember(remembered)
++      router.push('/self-timer/club')
++    } finally { setLoading(false) }
++  }
++
+   async function lookupTimer() {
+     if (!lookupSeat || !lookupName.trim()) {
+       setError(lang === 'zh' ? '请选择座位号并填写名字' : 'Please choose your seat and enter your name')
+@@ -183,6 +281,7 @@ export default function SelfTimerPage() {
+             <button className="btn-primary w-full" onClick={() => setPhase('form')}>{c.start}</button>
+             <button className="btn-secondary w-full" onClick={() => setPhase('tutorial')}>{c.tutorial}</button>
+             <button className="btn-secondary w-full" onClick={() => { setError(''); setPhase('lookup') }}>{c.lookupTitle}</button>
++            <button className="btn-secondary w-full" onClick={() => { setError(''); setClubEmail(''); setPhase('club') }}>{c.club}</button>
+             <p className="text-center text-xs text-stone-400">{c.contactStaff}</p>
+           </div>
+         )}
+@@ -247,6 +346,17 @@ export default function SelfTimerPage() {
+         {phase === 'form' && (
+           <div className="card p-5 space-y-4">
+             <p className="rounded-2xl bg-stone-50 px-4 py-3 text-xs leading-5 text-stone-500">{c.guestOnly}</p>
++            {member
++              ? <p className="rounded-2xl bg-terracotta/5 border border-terracotta/20 px-4 py-3 text-xs leading-5 text-charcoal">{c.memberStarting(member.display_name ?? member.email)}</p>
++              : (
++                <button
++                  type="button"
++                  className="w-full text-left text-xs font-medium text-terracotta underline"
++                  onClick={() => { setError(''); setClubEmail(''); setPhase('signin') }}
++                >
++                  {c.memberStartHint}
++                </button>
++              )}
+             <div>
+               <span className="label">{c.tableLabel}</span>
+               <div className="mt-2 flex flex-wrap gap-2">
+@@ -292,6 +402,64 @@ export default function SelfTimerPage() {
+           </div>
+         )}
+ 
++        {phase === 'club' && (
++          <div className="card p-5 space-y-4">
++            <h2 className="font-display text-xl font-semibold text-charcoal">{c.club}</h2>
++            <p className="text-sm leading-6 text-charcoal-light">{c.clubIntro}</p>
++            {member ? (
++              <>
++                <p className="rounded-2xl bg-stone-50 px-4 py-3 text-sm text-charcoal">{c.clubWelcome(member.display_name ?? member.email)}</p>
++                <button className="btn-primary w-full" onClick={() => router.push('/self-timer/club')}>{c.clubContinue(member.display_name ?? member.email)}</button>
++                <button className="btn-secondary w-full" onClick={() => { setError(''); setClubEmail(''); setPhase('signin') }}>{c.clubSwitch}</button>
++                <button className="btn-ghost w-full" onClick={() => { forgetMember(); setMember(null) }}>{c.clubForget}</button>
++              </>
++            ) : (
++              <>
++                <button className="btn-primary w-full" onClick={() => { setError(''); setPhase('join') }}>{c.clubJoin}</button>
++                <button className="btn-secondary w-full" onClick={() => { setError(''); setPhase('signin') }}>{c.clubSignin}</button>
++              </>
++            )}
++            {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
++            <button className="btn-ghost w-full" onClick={() => { setError(''); setPhase('home') }}>{c.confirmBack}</button>
++          </div>
++        )}
++
++        {phase === 'join' && (
++          <div className="card p-5 space-y-4">
++            <h2 className="font-display text-xl font-semibold text-charcoal">{c.clubJoinTitle}</h2>
++            <label className="block">
++              <span className="label">{c.clubNameLabel}</span>
++              <input className={inputCls} value={clubName} onChange={e => setClubName(e.target.value)} placeholder={c.namePlaceholder} />
++            </label>
++            <label className="block">
++              <span className="label">{c.clubEmailLabel}</span>
++              <input className={inputCls} type="email" inputMode="email" autoComplete="email" value={clubEmail} onChange={e => setClubEmail(e.target.value)} />
++            </label>
++            <label className="flex items-start gap-2 text-xs leading-5 text-charcoal-light">
++              <input type="checkbox" className="mt-0.5" checked={clubConsent} onChange={e => setClubConsent(e.target.checked)} />
++              <span>{c.clubConsent}</span>
++            </label>
++            <p className="text-xs leading-5 text-stone-400">{c.clubJoinHint}</p>
++            {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
++            <button className="btn-primary w-full" onClick={joinClub} disabled={loading}>{loading ? c.clubSubmitting : c.clubSubmitJoin}</button>
++            <button className="btn-ghost w-full" onClick={() => { setError(''); setPhase('club') }}>{c.confirmBack}</button>
++          </div>
++        )}
++
++        {phase === 'signin' && (
++          <div className="card p-5 space-y-4">
++            <h2 className="font-display text-xl font-semibold text-charcoal">{c.clubSigninTitle}</h2>
++            <p className="text-sm leading-6 text-charcoal-light">{c.clubSigninHint}</p>
++            <label className="block">
++              <span className="label">{c.clubEmailLabel}</span>
++              <input className={inputCls} type="email" inputMode="email" autoComplete="email" value={clubEmail} onChange={e => setClubEmail(e.target.value)} />
++            </label>
++            {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
++            <button className="btn-primary w-full" onClick={signinMember} disabled={loading}>{loading ? c.clubSubmitting : c.clubSubmitSignin}</button>
++            <button className="btn-ghost w-full" onClick={() => { setError(''); setPhase('club') }}>{c.confirmBack}</button>
++          </div>
++        )}
++
+         {phase === 'lookup' && (
+           <div className="card p-5 space-y-4">
+             <h2 className="font-display text-xl font-semibold text-charcoal">{c.lookupTitle}</h2>
+@@ -356,6 +524,7 @@ export default function SelfTimerPage() {
+               <p>{c.tableLabel}: <strong className="text-charcoal">{tableNumber}</strong></p>
+               <p>{c.seatLabel}: <strong className="text-charcoal">{seatNumber}</strong></p>
+               <p>{c.name}: <strong className="text-charcoal">{customerName}</strong></p>
++              {member && <p className="mt-1 text-terracotta">{c.memberStarting(member.display_name ?? member.email)}</p>}
+             </div>
+             {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
+             <button className="btn-primary w-full" onClick={startTimer} disabled={loading}>{loading ? c.starting : c.confirmStart}</button>
+diff --git a/app/api/admin/members/[id]/route.ts b/app/api/admin/members/[id]/route.ts
+new file mode 100644
+index 0000000..97c6760
+--- /dev/null
++++ b/app/api/admin/members/[id]/route.ts
+@@ -0,0 +1,125 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { createAdminClient } from '@/lib/supabase/admin'
++import { createClient } from '@/lib/supabase/server'
++import {
++  activateVipMonth,
++  associateFriendRewardCoupon,
++  findMemberById,
++  getMemberDashboard,
++  linkSessionToMember,
++  mapMemberError,
++  setMemberActive,
++  updateMemberName,
++} from '@/lib/member/service'
++import { londonDateOf } from '@/lib/member/member'
++
++// ── 后台会员详情与操作（PRD 16）───────────────────────────────────────────────
++// 允许：挂订单、核销奖励、把朋友券关联到优惠券、代激活 VIP、停用会员。
++// 禁止：手动加减 Visit、直接改 Reward Progress、改邮箱、删历史（PRD 16.3）。
++
++type Action =
++  | 'disable'
++  | 'enable'
++  | 'update_name'
++  | 'link_session'
++  | 'activate_vip'
++  | 'associate_friend_coupon'
++
++interface PatchBody {
++  action:       Action
++  is_active?:   boolean
++  display_name?: string
++  session_id?:  string
++  reward_id?:   string
++  coupon_code?: string
++}
++
++export async function GET(
++  _req: NextRequest,
++  { params }: { params: Promise<{ id: string }> },
++) {
++  const supabase = await createClient()
++  const { data: { user } } = await supabase.auth.getUser()
++  if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
++
++  const { id }  = await params
++  const admin   = createAdminClient()
++
++  try {
++    const member = await findMemberById(admin, id)
++    if (!member) return NextResponse.json({ error: mapMemberError('MEMBER_NOT_FOUND') }, { status: 404 })
++
++    const dashboard = await getMemberDashboard(admin, id, {
++      visitLimit:  50,
++      londonToday: londonDateOf(new Date()),
++    })
++
++    return NextResponse.json({ member, dashboard })
++  } catch (err) {
++    const code = err instanceof Error ? err.message : ''
++    console.error('[GET /api/admin/members/[id]]', code)
++    return NextResponse.json({ error: mapMemberError(code) }, { status: 500 })
++  }
++}
++
++export async function PATCH(
++  request: NextRequest,
++  { params }: { params: Promise<{ id: string }> },
++) {
++  const supabase = await createClient()
++  const { data: { user } } = await supabase.auth.getUser()
++  if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
++
++  const { id } = await params
++  const body   = await request.json() as PatchBody
++  const admin  = createAdminClient()
++
++  const allowed: Action[] = ['disable', 'enable', 'update_name', 'link_session', 'activate_vip', 'associate_friend_coupon']
++  if (!allowed.includes(body.action)) {
++    return NextResponse.json({ error: '无效操作' }, { status: 400 })
++  }
++
++  try {
++    const member = await findMemberById(admin, id)
++    if (!member) return NextResponse.json({ error: mapMemberError('MEMBER_NOT_FOUND') }, { status: 404 })
++
++    if (body.action === 'disable' || body.action === 'enable') {
++      const result = await setMemberActive(admin, id, body.action === 'enable')
++      if (!result.ok) return NextResponse.json({ error: mapMemberError(result.error) }, { status: 409 })
++      return NextResponse.json({ success: true, is_active: body.action === 'enable' })
++    }
++
++    if (body.action === 'update_name') {
++      const result = await updateMemberName(admin, id, body.display_name ?? '')
++      if (!result.ok) return NextResponse.json({ error: mapMemberError(result.error) }, { status: 409 })
++      return NextResponse.json({ success: true })
++    }
++
++    if (body.action === 'link_session') {
++      if (!body.session_id) return NextResponse.json({ error: '缺少订单号' }, { status: 400 })
++      const result = await linkSessionToMember(admin, body.session_id, id)
++      if (!result.ok) return NextResponse.json({ error: mapMemberError(result.error) }, { status: 409 })
++      return NextResponse.json({ success: true })
++    }
++
++    if (body.action === 'activate_vip') {
++      if (!body.reward_id) return NextResponse.json({ error: '缺少奖励参数' }, { status: 400 })
++      const result = await activateVipMonth(admin, body.reward_id, user.email ?? user.id)
++      if (!result.ok) return NextResponse.json({ error: mapMemberError(result.error) }, { status: 409 })
++      return NextResponse.json({ benefit: result.benefit })
++    }
++
++    // associate_friend_coupon
++    if (!body.reward_id || !body.coupon_code) {
++      return NextResponse.json({ error: '缺少奖励或优惠券参数' }, { status: 400 })
++    }
++    const linked = await associateFriendRewardCoupon(admin, body.reward_id, body.coupon_code)
++    if (!linked.ok) return NextResponse.json({ error: mapMemberError(linked.error) }, { status: 409 })
++    return NextResponse.json({ success: true })
++
++  } catch (err) {
++    const code = err instanceof Error ? err.message : ''
++    console.error('[PATCH /api/admin/members/[id]]', code)
++    return NextResponse.json({ error: mapMemberError(code) }, { status: 500 })
++  }
++}
+diff --git a/app/api/admin/members/route.ts b/app/api/admin/members/route.ts
+new file mode 100644
+index 0000000..2a38f31
+--- /dev/null
++++ b/app/api/admin/members/route.ts
+@@ -0,0 +1,25 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { createAdminClient } from '@/lib/supabase/admin'
++import { createClient } from '@/lib/supabase/server'
++import { listMembers, mapMemberError } from '@/lib/member/service'
++
++// ── GET /api/admin/members — 后台会员列表（PRD 16.1）─────────────────────────
++
++export async function GET(request: NextRequest) {
++  const supabase = await createClient()
++  const { data: { user } } = await supabase.auth.getUser()
++  if (!user) return NextResponse.json({ error: '未授权' }, { status: 401 })
++
++  const { searchParams } = new URL(request.url)
++  const search = searchParams.get('search')
++
++  try {
++    const admin   = createAdminClient()
++    const members = await listMembers(admin, { search, limit: 100 })
++    return NextResponse.json(members)
++  } catch (err) {
++    const code = err instanceof Error ? err.message : ''
++    console.error('[GET /api/admin/members]', code)
++    return NextResponse.json({ error: mapMemberError(code) }, { status: 500 })
++  }
++}
+diff --git a/app/api/admin/timers/[id]/route.ts b/app/api/admin/timers/[id]/route.ts
+index 08ca3c8..01be3e8 100644
+--- a/app/api/admin/timers/[id]/route.ts
++++ b/app/api/admin/timers/[id]/route.ts
+@@ -7,6 +7,8 @@ import { calcBillingMinutes, calcBill } from '@/lib/timer/pricing'
+ import { resolveActiveSeatCodeFromValue } from '@/lib/timer/selfService'
+ import { computeSettlement } from '@/lib/coupon/coupon'
+ import { loadSettlementContext, mapRpcError } from '@/lib/coupon/service'
++import { computeMemberDiscount, londonDateOf, type DiscountSource, type RewardType } from '@/lib/member/member'
++import { getMemberSettleInfo, mapMemberError } from '@/lib/member/service'
+ 
+ type Action = 'start' | 'pause' | 'resume' | 'stop' | 'settle' | 'unsettle' | 'update_table'
+ 
+@@ -28,7 +30,24 @@ export async function GET(
+     .single()
+ 
+   if (error || !data) return NextResponse.json({ error: '计时订单不存在' }, { status: 404 })
+-  return NextResponse.json({ session: data })
++
++  // 结算台要显示这个订单的会员是谁：邮箱没有验证过，店员核对柜台前的人是目前唯一的防线
++  let member = null
++  if (data.member_id) {
++    const info = await getMemberSettleInfo(admin, data.member_id as string, londonDateOf(new Date()))
++    if (info) {
++      member = {
++        member_id:           info.member.member_id,
++        display_name:        info.member.display_name,
++        email:               info.member.email,
++        vip_active:          info.vipActive,
++        vip_expires_on:      info.vipExpiresOn,
++        usable_reward_types: info.usableTypes,
++      }
++    }
++  }
++
++  return NextResponse.json({ session: data, member })
+ }
+ 
+ export async function DELETE(
+@@ -69,7 +88,15 @@ export async function PATCH(
+ 
+   const { id }   = await params
+   // 注意：结算金额一律由服务端计算，客户端传入的 actual_amount_gbp / 折扣字段会被忽略
+-  const body     = await request.json() as { action: Action; coupon_code?: string; settlement_note?: string; table_number?: string }
++  const body     = await request.json() as {
++    action:           Action
++    coupon_code?:     string
++    settlement_note?: string
++    table_number?:    string
++    discount_source?: DiscountSource
++    member_id?:       string   // 朋友用券时，折扣出自另一位会员（PRD 10.3）
++    reward_type?:     RewardType
++  }
+   const { action } = body
+ 
+   if (!['start', 'pause', 'resume', 'stop', 'settle', 'unsettle', 'update_table'].includes(action)) {
+@@ -112,21 +139,63 @@ export async function PATCH(
+   const now    = new Date()
+   let update: Record<string, unknown> = {}
+ 
+-  // ── 结算（服务端计算金额 + 同一事务内核销优惠券）─────────────────────────────
++  // ── 结算（服务端计算金额 + 同一事务内核销优惠券或会员奖励）────────────────────
+   if (action === 'settle') {
+     const ctx = await loadSettlementContext(admin, id, body.coupon_code)
+     if (!ctx.ok) return NextResponse.json({ error: ctx.error }, { status: ctx.status })
+ 
+-    const computed = computeSettlement(ctx.context.session, ctx.context.coupon)
+-    if (!computed.ok) return NextResponse.json({ error: computed.error }, { status: 400 })
++    const sessionMemberId = (session.member_id as string | null) ?? null
++    // 朋友用券时折扣出自另一位会员，所以「奖励的拥有者」可能不等于本单的归属人
++    const sponsorMemberId = body.member_id ?? sessionMemberId
++    const memberInfo = sponsorMemberId
++      ? await getMemberSettleInfo(admin, sponsorMemberId, londonDateOf(new Date()))
++      : null
++
++    // 没显式指定来源时：本单会员有生效中的 VIP 就强制走 VIP（PRD 11.4），
++    // 否则按有没有券码决定用券还是不用优惠。
++    const source: DiscountSource = body.discount_source
++      ?? (memberInfo?.vipActive && sponsorMemberId === sessionMemberId ? 'vip_month'
++        : body.coupon_code ? 'coupon'
++        : 'none')
++
++    let discountPence: number
++    let preview: unknown
++    let couponCode: string | null = null
++
++    if (source === 'coupon') {
++      const computed = computeSettlement(ctx.context.session, ctx.context.coupon)
++      if (!computed.ok) return NextResponse.json({ error: computed.error }, { status: 400 })
++      discountPence = computed.preview.discountAmountPence
++      couponCode    = computed.preview.couponCode
++      preview       = computed.preview
++    } else {
++      const computed = computeMemberDiscount(source, {
++        amountGbp:  ctx.context.session.amount_gbp,
++        vipActive:  Boolean(memberInfo?.vipActive),
++        rewardType: body.reward_type ?? null,
++      })
++      if (!computed.ok) return NextResponse.json({ error: mapMemberError(computed.error) }, { status: 400 })
++      discountPence = computed.preview.discountAmountPence
++      preview       = computed.preview
++    }
+ 
+-    const { data: settled, error: rpcErr } = await admin.rpc('settle_timer_session', {
++    // 金额一律服务端算好传进去，数据库再拿自己的记录复核一遍，对不上就报错。
++    // 会员参数只在真的用到会员折扣时传：迁移还没上的环境里旧版函数只有五个参数，
++    // 多传参数会让店员连普通结算都做不了。
++    const rpcParams: Record<string, unknown> = {
+       p_session_id:            id,
+       p_settled_by:            user.email ?? user.id,
+       p_settlement_note:       body.settlement_note ?? null,
+-      p_coupon_code:           computed.preview.couponCode,
+-      p_discount_amount_pence: computed.preview.discountAmountPence,
+-    })
++      p_coupon_code:           couponCode,
++      p_discount_amount_pence: discountPence,
++    }
++    if (source === 'member_reward' || source === 'vip_month') {
++      rpcParams.p_discount_source = source
++      rpcParams.p_member_id       = source === 'member_reward' ? sponsorMemberId : sessionMemberId
++      rpcParams.p_reward_type     = source === 'member_reward' ? (body.reward_type ?? null) : null
++    }
++
++    const { data: settled, error: rpcErr } = await admin.rpc('settle_timer_session', rpcParams)
+ 
+     if (rpcErr) {
+       console.error('[settle /api/admin/timers]', rpcErr.message)
+@@ -143,7 +212,7 @@ export async function PATCH(
+         .in('status', ['confirmed', 'payment_pending'])
+     }
+ 
+-    return NextResponse.json({ session: settled, preview: computed.preview })
++    return NextResponse.json({ session: settled, preview, discount_source: source })
+   }
+ 
+   // ── 撤销结算（同一事务内恢复优惠券）─────────────────────────────────────────
+diff --git a/app/api/admin/timers/route.ts b/app/api/admin/timers/route.ts
+index 4d6066d..7757933 100644
+--- a/app/api/admin/timers/route.ts
++++ b/app/api/admin/timers/route.ts
+@@ -89,5 +89,22 @@ export async function GET(request: NextRequest) {
+   const { data, error } = await query
+   if (error) return NextResponse.json({ error: error.message }, { status: 500 })
+ 
+-  return NextResponse.json({ sessions: data })
++  // 会员信息单独查一次，不做 join：迁移还没上的环境里 timer_sessions 没有 member_id 列，
++  // 直接 join members 会让整个列表报错。取到 member_id 才查，取不到就跳过。
++  const rows = (data ?? []) as { member_id?: string | null }[]
++  const memberIds = [...new Set(rows.map(r => r.member_id).filter((v): v is string => Boolean(v)))]
++  const memberById = new Map<string, { display_name: string | null; email: string }>()
++  if (memberIds.length > 0) {
++    const { data: members } = await admin
++      .from('members')
++      .select('member_id, display_name, email')
++      .in('member_id', memberIds)
++    for (const m of members ?? []) {
++      memberById.set(m.member_id as string, { display_name: m.display_name as string | null, email: m.email as string })
++    }
++  }
++
++  return NextResponse.json({
++    sessions: rows.map(r => ({ ...r, member: r.member_id ? memberById.get(r.member_id) ?? null : null })),
++  })
+ }
+diff --git a/app/api/bookings/route.ts b/app/api/bookings/route.ts
+index b45ac0f..c45632a 100644
+--- a/app/api/bookings/route.ts
++++ b/app/api/bookings/route.ts
+@@ -10,6 +10,7 @@ import { sendEmail } from '@/lib/email/sender'
+ import { buildConfirmationEmail } from '@/lib/email/templates/confirmation'
+ import { generateCancelToken, buildCancelUrl } from '@/lib/token/cancelToken'
+ import { notifyAdminNewBooking } from '@/lib/email/notifyAdmin'
++import { ensureMember } from '@/lib/member/service'
+ 
+ // ── POST /api/bookings — 提交新预约 ───────────────────────────────────────────
+ 
+@@ -26,6 +27,8 @@ const BookingSchema = z.object({
+   email:           z.string().email('请输入有效的邮箱地址').max(100),
+   remark:          z.string().max(500).optional(),
+   lang:            z.enum(['zh', 'en']).optional().default('zh'),
++  // 勾选「加入 Tangdouren Club」：随预约一起建会员，不等支付结果（PRD 2.3）
++  joinClub:        z.boolean().optional().default(false),
+ })
+ 
+ export async function POST(request: NextRequest) {
+@@ -39,7 +42,24 @@ export async function POST(request: NextRequest) {
+     }
+ 
+     const supabase = createAdminClient()
+-    const result   = await createBooking(parsed.data, supabase)
++    // joinClub 只用于会员，不进 bookings 表
++    const { joinClub, ...bookingInput } = parsed.data
++    const result   = await createBooking(bookingInput, supabase)
++
++    // 勾选了加入会员就在这里建，失败也不连累预约本身
++    let memberJoined = false
++    if (joinClub) {
++      try {
++        const { member } = await ensureMember(supabase, {
++          email:         parsed.data.email,
++          displayName:   parsed.data.customerName,
++          consentSource: 'booking',
++        })
++        memberJoined = member.is_active
++      } catch (memberErr) {
++        console.error('[POST /api/bookings] 加入会员失败:', memberErr instanceof Error ? memberErr.message : memberErr)
++      }
++    }
+ 
+     // ── 支付关闭：直接确认预约，发送确认邮件 ──────────────────────────────────
+     if (!PAYMENT_ENABLED) {
+@@ -92,10 +112,10 @@ export async function POST(request: NextRequest) {
+         source:       '顾客在线预约',
+       })
+ 
+-      return NextResponse.json({ ...result, confirmed: true, depositAmount: 0 }, { status: 201 })
++      return NextResponse.json({ ...result, confirmed: true, depositAmount: 0, memberJoined }, { status: 201 })
+     }
+ 
+-    return NextResponse.json(result, { status: 201 })
++    return NextResponse.json({ ...result, memberJoined }, { status: 201 })
+ 
+   } catch (err: unknown) {
+     if (err instanceof BookingError) {
+diff --git a/app/api/member/activate-vip/route.ts b/app/api/member/activate-vip/route.ts
+new file mode 100644
+index 0000000..f36e885
+--- /dev/null
++++ b/app/api/member/activate-vip/route.ts
+@@ -0,0 +1,57 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { z } from 'zod'
++import { createAdminClient } from '@/lib/supabase/admin'
++import { activateVipMonth, findMemberByEmail, mapMemberError } from '@/lib/member/service'
++
++// ── POST /api/member/activate-vip — 会员自己激活 VIP Month（PRD 11.1）─────────
++// 解锁不自动激活，会员点 Activate 才生效；同一时间只能有一张生效（PRD 11.6），
++// 这个判断在数据库函数里靠行锁完成，应用层只负责核对奖励确实属于这个人。
++
++const ActivateSchema = z.object({
++  email:     z.string().email('请输入有效的邮箱地址').max(100),
++  reward_id: z.string().uuid('奖励参数有误'),
++})
++
++export async function POST(request: NextRequest) {
++  let body: unknown
++  try { body = await request.json() } catch {
++    return NextResponse.json({ error: '请求格式错误' }, { status: 400 })
++  }
++
++  const parsed = ActivateSchema.safeParse(body)
++  if (!parsed.success) {
++    return NextResponse.json({ error: parsed.error.errors[0]?.message ?? '参数有误' }, { status: 400 })
++  }
++
++  try {
++    const admin  = createAdminClient()
++    const member = await findMemberByEmail(admin, parsed.data.email)
++    if (!member) return NextResponse.json({ error: '这个邮箱还不是会员' }, { status: 404 })
++    if (!member.is_active) {
++      return NextResponse.json({ error: mapMemberError('MEMBER_INACTIVE') }, { status: 403 })
++    }
++
++    // 奖励必须属于这个会员，否则任何人都能拿别人的 reward_id 来激活
++    const { data: reward } = await admin
++      .from('member_rewards')
++      .select('reward_id, reward_type, member_id')
++      .eq('reward_id', parsed.data.reward_id)
++      .maybeSingle()
++
++    if (!reward || reward.member_id !== member.member_id) {
++      return NextResponse.json({ error: mapMemberError('MEMBER_REWARD_NOT_FOUND') }, { status: 404 })
++    }
++
++    const result = await activateVipMonth(admin, parsed.data.reward_id, 'member')
++    if (!result.ok) {
++      return NextResponse.json({ error: mapMemberError(result.error) }, { status: 409 })
++    }
++
++    return NextResponse.json({ benefit: result.benefit })
++
++  } catch (err) {
++    const code = err instanceof Error ? err.message : ''
++    console.error('[POST /api/member/activate-vip]', code)
++    return NextResponse.json({ error: mapMemberError(code) }, { status: 500 })
++  }
++}
+diff --git a/app/api/member/dashboard/route.ts b/app/api/member/dashboard/route.ts
+new file mode 100644
+index 0000000..0053c65
+--- /dev/null
++++ b/app/api/member/dashboard/route.ts
+@@ -0,0 +1,45 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { z } from 'zod'
++import { createAdminClient } from '@/lib/supabase/admin'
++import { findMemberByEmail, getMemberDashboard, mapMemberError } from '@/lib/member/service'
++import { londonDateOf } from '@/lib/member/member'
++
++// ── POST /api/member/dashboard — 会员首页数据（PRD 12、13、14）───────────────
++// 设备上缓存的会员身份不是凭证，每次进页面都按邮箱重新查一遍数据库（PRD 4.3）。
++
++const DashboardSchema = z.object({
++  email:      z.string().email('请输入有效的邮箱地址').max(100),
++  visitLimit: z.number().int().min(1).max(100).optional(),
++})
++
++export async function POST(request: NextRequest) {
++  let body: unknown
++  try { body = await request.json() } catch {
++    return NextResponse.json({ error: '请求格式错误' }, { status: 400 })
++  }
++
++  const parsed = DashboardSchema.safeParse(body)
++  if (!parsed.success) {
++    return NextResponse.json({ error: parsed.error.errors[0]?.message ?? '参数有误' }, { status: 400 })
++  }
++
++  try {
++    const admin  = createAdminClient()
++    const member = await findMemberByEmail(admin, parsed.data.email)
++
++    if (!member) return NextResponse.json({ error: '这个邮箱还不是会员' }, { status: 404 })
++
++    const dashboard = await getMemberDashboard(admin, member.member_id, {
++      visitLimit:  parsed.data.visitLimit ?? 10,
++      londonToday: londonDateOf(new Date()),
++    })
++    if (!dashboard) return NextResponse.json({ error: '这个邮箱还不是会员' }, { status: 404 })
++
++    return NextResponse.json({ dashboard })
++
++  } catch (err) {
++    const code = err instanceof Error ? err.message : ''
++    console.error('[POST /api/member/dashboard]', code)
++    return NextResponse.json({ error: mapMemberError(code) }, { status: 500 })
++  }
++}
+diff --git a/app/api/member/join/route.ts b/app/api/member/join/route.ts
+new file mode 100644
+index 0000000..532cbbb
+--- /dev/null
++++ b/app/api/member/join/route.ts
+@@ -0,0 +1,54 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { z } from 'zod'
++import { createAdminClient } from '@/lib/supabase/admin'
++import { ensureMember, mapMemberError } from '@/lib/member/service'
++import { maskEmail } from '@/lib/member/member'
++
++// ── POST /api/member/join — 加入 Tangdouren Club ──────────────────────────────
++// 邮箱已经注册过时不报错，直接识别为已有会员并返回（PRD 2.3）。
++
++const JoinSchema = z.object({
++  name:    z.string().min(1, '请填写姓名').max(50),
++  email:   z.string().email('请输入有效的邮箱地址').max(100),
++  consent: z.boolean().refine(v => v === true, '请先勾选同意会员条款'),
++})
++
++export async function POST(request: NextRequest) {
++  let body: unknown
++  try { body = await request.json() } catch {
++    return NextResponse.json({ error: '请求格式错误' }, { status: 400 })
++  }
++
++  const parsed = JoinSchema.safeParse(body)
++  if (!parsed.success) {
++    return NextResponse.json({ error: parsed.error.errors[0]?.message ?? '参数有误' }, { status: 400 })
++  }
++
++  try {
++    const admin = createAdminClient()
++    const { member, created } = await ensureMember(admin, {
++      email:         parsed.data.email,
++      displayName:   parsed.data.name,
++      consentSource: 'in_store',
++    })
++
++    if (!member.is_active) {
++      return NextResponse.json({ error: mapMemberError('MEMBER_INACTIVE') }, { status: 403 })
++    }
++
++    return NextResponse.json({
++      created,
++      member: {
++        member_id:    member.member_id,
++        display_name: member.display_name,
++        email_masked: maskEmail(member.email),
++      },
++    }, { status: created ? 201 : 200 })
++
++  } catch (err) {
++    const code = err instanceof Error ? err.message : ''
++    console.error('[POST /api/member/join]', code)
++    const status = code === 'INVALID_EMAIL' ? 400 : 500
++    return NextResponse.json({ error: mapMemberError(code) }, { status })
++  }
++}
+diff --git a/app/api/member/lookup/route.ts b/app/api/member/lookup/route.ts
+new file mode 100644
+index 0000000..7794edc
+--- /dev/null
++++ b/app/api/member/lookup/route.ts
+@@ -0,0 +1,49 @@
++import { NextRequest, NextResponse } from 'next/server'
++import { z } from 'zod'
++import { createAdminClient } from '@/lib/supabase/admin'
++import { findMemberByEmail, mapMemberError } from '@/lib/member/service'
++import { maskEmail } from '@/lib/member/member'
++
++// ── POST /api/member/lookup — 已有会员只输邮箱识别（PRD 4.2）──────────────────
++// 用 POST 而不是 GET：邮箱不落在 URL 与访问日志里。
++
++const LookupSchema = z.object({
++  email: z.string().email('请输入有效的邮箱地址').max(100),
++})
++
++export async function POST(request: NextRequest) {
++  let body: unknown
++  try { body = await request.json() } catch {
++    return NextResponse.json({ error: '请求格式错误' }, { status: 400 })
++  }
++
++  const parsed = LookupSchema.safeParse(body)
++  if (!parsed.success) {
++    return NextResponse.json({ error: parsed.error.errors[0]?.message ?? '参数有误' }, { status: 400 })
++  }
++
++  try {
++    const admin  = createAdminClient()
++    const member = await findMemberByEmail(admin, parsed.data.email)
++
++    if (!member) {
++      return NextResponse.json({ error: '这个邮箱还不是会员，请先加入会员' }, { status: 404 })
++    }
++    if (!member.is_active) {
++      return NextResponse.json({ error: mapMemberError('MEMBER_INACTIVE') }, { status: 403 })
++    }
++
++    return NextResponse.json({
++      member: {
++        member_id:    member.member_id,
++        display_name: member.display_name,
++        email_masked: maskEmail(member.email),
++      },
++    })
++
++  } catch (err) {
++    const code = err instanceof Error ? err.message : ''
++    console.error('[POST /api/member/lookup]', code)
++    return NextResponse.json({ error: mapMemberError(code) }, { status: 500 })
++  }
++}
+diff --git a/app/api/self-timer/start/route.ts b/app/api/self-timer/start/route.ts
+index d03c378..1bdb900 100644
+--- a/app/api/self-timer/start/route.ts
++++ b/app/api/self-timer/start/route.ts
+@@ -9,6 +9,10 @@ const StartSchema = z.object({
+   customerName: z.string().min(1).max(50),
+   confirmNoMixedBeans: z.boolean(),
+   idempotencyKey: z.string().min(8).max(120).optional(),
++  // 允许留空：空字符串等于「不以会员身份开始」，不能因此阻断普通计时
++  memberEmail: z.string().max(100).optional()
++    .transform(v => (v && v.trim() ? v.trim() : undefined))
++    .refine(v => v === undefined || /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(v), '邮箱格式不正确'),
+ })
+ 
+ function messageForError(error: unknown): { message: string; status: number } {
+diff --git a/components/admin/Sidebar.tsx b/components/admin/Sidebar.tsx
+index 6fc642a..c202b28 100644
+--- a/components/admin/Sidebar.tsx
++++ b/components/admin/Sidebar.tsx
+@@ -3,7 +3,7 @@
+ import { useState } from 'react'
+ import { useRouter } from 'next/navigation'
+ import Link from 'next/link'
+-import { LayoutDashboard, CalendarDays, Settings2, ImageIcon, Menu, X, LogOut, Timer, TicketPercent } from 'lucide-react'
++import { LayoutDashboard, CalendarDays, Settings2, ImageIcon, Menu, X, LogOut, Timer, TicketPercent, Users } from 'lucide-react'
+ import { cn } from '@/lib/utils'
+ import { createClient } from '@/lib/supabase/client'
+ 
+@@ -14,6 +14,7 @@ const navItems = [
+   { href: '/dashboard/slots',    icon: Settings2,       label: 'Slot 配置' },
+   { href: '/dashboard/gallery',  icon: ImageIcon,       label: '作品图库' },
+   { href: '/dashboard/coupons',  icon: TicketPercent,   label: '优惠券' },
++  { href: '/dashboard/members',  icon: Users,           label: '会员' },
+ ]
+ 
+ export default function Sidebar({ active }: { active: string }) {
+diff --git a/components/member/MemberProgressBar.tsx b/components/member/MemberProgressBar.tsx
+new file mode 100644
+index 0000000..b89d75f
+--- /dev/null
++++ b/components/member/MemberProgressBar.tsx
+@@ -0,0 +1,92 @@
++'use client'
++
++// 会员进度条（PRD 7.1）：十格循环显示，2 / 5 / 8 / 10 是奖励节点。
++// 顾客端不出现「第几轮」这类概念，只显示本轮的第几格。
++
++import { Star } from 'lucide-react'
++import type { Lang } from '@/lib/i18n/translations'
++import type { NextReward, ProgressCell, RewardType } from '@/lib/member/member'
++
++const copy = {
++  zh: {
++    visits:        (done: number, total: number) => `${done} / ${total} 次到店`,
++    lifetime:      (n: number) => `累计到店 ${n} 次`,
++    toNext:        (n: number) => `再 ${n} 次解锁下一个奖励`,
++    nextIs:        '下一个奖励',
++    roundDone:     '本轮已完成，下一格自动开始新一轮',
++    rewards: {
++      TWO_POUND:       '£2',
++      FIVE_POUND:      '£5',
++      PERSONAL_15_OFF: '🎁',
++      FRIEND_10_OFF:   '🎁',
++      VIP_MONTH:       'VIP',
++    } as Record<RewardType, string>,
++  },
++  en: {
++    visits:        (done: number, total: number) => `${done} / ${total} visits`,
++    lifetime:      (n: number) => `Lifetime visits: ${n}`,
++    toNext:        (n: number) => `${n} more ${n === 1 ? 'visit' : 'visits'} to your next reward`,
++    nextIs:        'Next reward',
++    roundDone:     'This round is complete — the next visit starts a new round',
++    rewards: {
++      TWO_POUND:       '£2',
++      FIVE_POUND:      '£5',
++      PERSONAL_15_OFF: '🎁',
++      FRIEND_10_OFF:   '🎁',
++      VIP_MONTH:       'VIP',
++    } as Record<RewardType, string>,
++  },
++} as const
++
++interface Props {
++  cells:          ProgressCell[]
++  cycleProgress:  number
++  nextReward:     NextReward | null
++  lifetimeVisits: number
++  lang:           Lang
++}
++
++export default function MemberProgressBar({ cells, cycleProgress, nextReward, lifetimeVisits, lang }: Props) {
++  const c = copy[lang]
++
++  return (
++    <div className="rounded-3xl border border-sand-200 bg-white p-5 shadow-sm">
++      <p className="text-sm font-semibold text-charcoal">{c.visits(cycleProgress, cells.length)}</p>
++
++      <div className="mt-4 flex items-center gap-1">
++        {cells.map((cell, index) => (
++          <div key={cell.index} className="flex flex-1 items-center">
++            <div className="flex flex-1 flex-col items-center gap-1">
++              <span
++                aria-hidden
++                className={
++                  cell.state === 'done'
++                    ? 'flex h-6 w-6 items-center justify-center rounded-full bg-terracotta text-white'
++                    : cell.state === 'current'
++                      ? 'flex h-6 w-6 items-center justify-center rounded-full border-2 border-terracotta bg-white'
++                      : 'flex h-6 w-6 items-center justify-center rounded-full border border-sand-200 bg-white'
++                }
++              >
++                {cell.isRewardNode
++                  ? <Star size={12} className={cell.state === 'done' ? 'text-white' : 'text-terracotta'} />
++                  : <span className={`h-1.5 w-1.5 rounded-full ${cell.state === 'done' ? 'bg-white' : 'bg-sand-200'}`} />}
++              </span>
++              <span className="h-4 text-[10px] leading-4 text-charcoal-light">
++                {cell.isRewardNode ? cell.rewardTypes.map(rt => c.rewards[rt]).filter((v, i, a) => a.indexOf(v) === i).join('/') : ''}
++              </span>
++            </div>
++            {index < cells.length - 1 && (
++              <span aria-hidden className={`-mt-5 h-0.5 flex-1 ${cell.state === 'done' ? 'bg-terracotta' : 'bg-sand-200'}`} />
++            )}
++          </div>
++        ))}
++      </div>
++
++      <p className="mt-3 text-sm text-charcoal">
++        {nextReward ? c.toNext(nextReward.remaining) : c.roundDone}
++        {nextReward && <span className="ml-1 text-charcoal-light">({c.nextIs}: {nextReward.rewardTypes.map(rt => c.rewards[rt]).filter((v, i, a) => a.indexOf(v) === i).join('/')})</span>}
++      </p>
++      <p className="mt-1 text-xs text-charcoal-light">{c.lifetime(lifetimeVisits)}</p>
++    </div>
++  )
++}
+diff --git a/lib/coupon/service.ts b/lib/coupon/service.ts
+index cae3b31..b063080 100644
+--- a/lib/coupon/service.ts
++++ b/lib/coupon/service.ts
+@@ -77,5 +77,21 @@ export function mapRpcError(message: string | undefined | null): string {
+   if (raw.includes('COUPON_TIME_NOT_APPLICABLE'))  return '当前订单没有可减免的续时时长'
+   if (raw.includes('COUPON_DISCOUNT_MISMATCH'))    return '优惠金额校验未通过，请重新验证优惠码'
+   if (raw.includes('COUPON_REDEMPTION_MISMATCH'))  return '优惠券核销状态异常，请刷新页面后重试'
++  // ── 会员相关（settle_timer_session 的会员分支。文案与 lib/member/service.ts 的 mapMemberError 一致）──
++  if (raw.includes('MEMBER_REQUIRED'))             return '该订单没有关联会员'
++  if (raw.includes('MEMBER_NOT_FOUND'))            return '找不到该会员'
++  if (raw.includes('MEMBER_SESSION_MISMATCH'))     return '这类奖励只能用于本人的订单，请先把订单关联到会员'
++  if (raw.includes('MEMBER_REWARD_UNAVAILABLE'))   return '该会员当前没有可用的这类奖励'
++  if (raw.includes('MEMBER_REWARD_COUPON_USED'))   return '该奖励对应的内部券已经被使用'
++  if (raw.includes('MEMBER_DISCOUNT_MISMATCH'))    return '会员优惠金额校验未通过，请刷新后重试'
++  if (raw.includes('MEMBER_DISCOUNT_MISSING'))     return '会员优惠金额缺失，请重新选择'
++  if (raw.includes('REWARD_TYPE_INVALID'))         return '奖励类型无效'
++  if (raw.includes('REWARD_ALREADY_USED'))         return '这个订单解锁的奖励已经被用掉了，需要管理员处理'
++  if (raw.includes('VIP_MUST_BE_APPLIED'))         return 'VIP 生效期间系统自动使用 VIP 85 折，不能改用其他会员优惠'
++  if (raw.includes('VIP_NOT_ACTIVE'))              return '该会员当前没有生效中的 VIP Month'
++  if (raw.includes('VIP_ALREADY_ACTIVATED'))       return '这张 VIP Month 已经激活过了'
++  if (raw.includes('MULTIPLE_DISCOUNT_SOURCES'))   return '一个订单只能使用一种优惠'
++  if (raw.includes('DISCOUNT_SOURCE_INVALID'))     return '优惠类型无效'
++  if (raw.includes('DISCOUNT_AMOUNT_INVALID'))     return '优惠金额异常，请重新选择'
+   return '操作失败，请重试'
+ }
+diff --git a/lib/i18n/translations.ts b/lib/i18n/translations.ts
+index 502c798..30b6779 100644
+--- a/lib/i18n/translations.ts
++++ b/lib/i18n/translations.ts
+@@ -338,6 +338,9 @@ export const t = {
+   step4DepositOff:   { zh: '✅ 提交后名额立即锁定，无需支付定金，到店结清即可', en: '✅ Your spot is confirmed instantly — no deposit required, just pay on arrival' },
+   step4Submitting:   { zh: '处理中…',        en: 'Processing…' },
+   step4Submit:       { zh: '确认预约',        en: 'Confirm Booking' },
++  step4JoinClub:     { zh: '顺便加入 Tangdouren Club', en: 'Also join Tangdouren Club' },
++  step4JoinClubHint: { zh: '每次到店计时都累积进度：满 2 次 £2 抵用券，满 5 次 £5，满 8 次本人 85 折加朋友 9 折，满 10 次送一个月 VIP。不想加入也能直接预约。', en: 'Every in-store visit builds progress: 2 visits for a £2 voucher, 5 for £5, 8 for 15% off for you and 10% off for a friend, 10 for a VIP Month. Joining is optional.' },
++  step5MemberJoined: { zh: '✅ 你已加入 Tangdouren Club，到店扫码后就能用自己的手机看到进度。', en: '✅ You have joined Tangdouren Club — scan in store to track your progress on your phone.' },
+   step4NetworkErr:   { zh: '网络错误，请检查连接后重试', en: 'Network error, please check your connection and try again' },
+ 
+   // Step 5 – Done
+diff --git a/lib/member/client.ts b/lib/member/client.ts
+new file mode 100644
+index 0000000..41de22c
+--- /dev/null
++++ b/lib/member/client.ts
+@@ -0,0 +1,37 @@
++// ============================================================
++// 浏览器端记住会员身份（PRD 4.3）
++// 只用于少打一次邮箱，**不是会员资格凭证**：每次进会员页都由服务端重新查
++// Member 状态、Visits、Rewards 与 VIP Month。所以这里只存识别信息，不存任何权益数据。
++// ============================================================
++
++export interface RememberedMember {
++  member_id:    string
++  display_name: string | null
++  email:        string
++}
++
++const MEMBER_LS_KEY = 'tangdouren_club_member'
++
++export function readRememberedMember(): RememberedMember | null {
++  try {
++    const raw = localStorage.getItem(MEMBER_LS_KEY)
++    if (!raw) return null
++    const parsed = JSON.parse(raw) as Partial<RememberedMember>
++    if (!parsed?.email || !parsed?.member_id) return null
++    return {
++      member_id:    parsed.member_id,
++      display_name: parsed.display_name ?? null,
++      email:        parsed.email,
++    }
++  } catch {
++    return null
++  }
++}
++
++export function rememberMember(member: RememberedMember): void {
++  try { localStorage.setItem(MEMBER_LS_KEY, JSON.stringify(member)) } catch {}
++}
++
++export function forgetMember(): void {
++  try { localStorage.removeItem(MEMBER_LS_KEY) } catch {}
++}
+diff --git a/lib/member/member.ts b/lib/member/member.ts
+new file mode 100644
+index 0000000..3666b96
+--- /dev/null
++++ b/lib/member/member.ts
+@@ -0,0 +1,463 @@
++// ============================================================
++// 会员：Visit 口径、奖励进度、奖励可用性与折扣计算的纯函数
++// 规则见《Tangdouren Club 会员系统 PRD v1》第 6、7、9、10、11、20、21 节
++//
++// 约定：
++//   1) 金额一律换算成「便士整数」计算，与 lib/coupon/coupon.ts 同一套口径。
++//   2) 折扣金额在这里算一遍，settle_timer_session 会拿数据库记录再复核一遍，
++//      对不上就报错。改这里必须同步改 supabase/migrations/017_member_settlement.sql。
++//   3) 本文件不碰数据库、不碰 React，可在浏览器、服务端与测试里共用。
++// ============================================================
++
++import { describeDiscount, londonToday, toPence, fromPence } from '../coupon/coupon.ts'
++
++// ── 常量 ────────────────────────────────────────────────────────────────────
++
++/** 每 10 个 Reward-eligible Visit 为一轮（PRD 7） */
++export const REWARD_CYCLE_SIZE = 10
++
++/** 一个会员同时最多一张 VIP Month 生效（PRD 11.6） */
++export const MAX_ACTIVE_VIP_MONTHS = 1
++
++/** VIP Month 有效期 30 天含首尾：expires_on = activated_on + 29（PRD 11.2） */
++export const VIP_MONTH_DAYS = 30
++export const VIP_MONTH_OFFSET_DAYS = VIP_MONTH_DAYS - 1
++
++export const TWO_POUND_PENCE = 200
++export const FIVE_POUND_PENCE = 500
++
++/** 折扣百分比：本人 15%、朋友 10%、VIP 15%（PRD 10、11.3） */
++export const PERSONAL_DISCOUNT_PERCENT = 15
++export const FRIEND_DISCOUNT_PERCENT = 10
++export const VIP_DISCOUNT_PERCENT = 15
++
++export type RewardType =
++  | 'TWO_POUND'
++  | 'FIVE_POUND'
++  | 'PERSONAL_15_OFF'
++  | 'FRIEND_10_OFF'
++  | 'VIP_MONTH'
++
++/** 一次结算只允许一个折扣来源（PRD 21） */
++export type DiscountSource = 'none' | 'coupon' | 'member_reward' | 'vip_month'
++
++/** 一轮里各档位的门槛与对应奖励。第 2 轮及以后靠 10 ×(轮次 - 1) + 档位 推到 12 / 15 / 18 / 20（PRD 7） */
++export const CYCLE_REWARD_NODES: readonly { node: number; rewardTypes: readonly RewardType[] }[] = [
++  { node: 2,  rewardTypes: ['TWO_POUND'] },
++  { node: 5,  rewardTypes: ['FIVE_POUND'] },
++  { node: 8,  rewardTypes: ['PERSONAL_15_OFF', 'FRIEND_10_OFF'] },
++  { node: 10, rewardTypes: ['VIP_MONTH'] },
++]
++
++/** 可以在结算台作为折扣使用的奖励类型（VIP Month 是权益，不是折扣来源） */
++export const USABLE_REWARD_TYPES: readonly RewardType[] = [
++  'TWO_POUND', 'FIVE_POUND', 'PERSONAL_15_OFF', 'FRIEND_10_OFF',
++]
++
++export interface MemberRewardRow {
++  reward_id:      string
++  member_id:      string
++  reward_type:    RewardType
++  cycle_index:    number
++  unlocked_at:    string
++  coupon_id:      string | null
++  used_at:        string | null
++}
++
++export interface VipBenefitRow {
++  benefit_id:   string
++  reward_id:    string
++  activated_on: string | null   // 伦敦当地 YYYY-MM-DD
++  expires_on:   string | null
++}
++
++// ── 身份 ────────────────────────────────────────────────────────────────────
++
++/** 会员以邮箱为唯一身份。email_key = lower(trim(email))，与数据库 members_email_key_check 同口径 */
++export function normalizeMemberEmail(email: unknown): string {
++  return typeof email === 'string' ? email.trim().toLowerCase() : ''
++}
++
++/** 邮箱形状：@ 前面要有东西，@ 后面要有域名点号（与 members_email_shape_check 同口径） */
++export function isValidMemberEmail(email: string): boolean {
++  const at = email.indexOf('@')
++  if (at <= 0) return false
++  const domain = email.slice(at + 1)
++  const dot = domain.indexOf('.')
++  return dot > 0 && dot < domain.length - 1 && !/\s/.test(email)
++}
++
++/** 客户端展示用的脱敏邮箱：z***@gmail.com（PRD 4.3 前后端都不提供改邮箱） */
++export function maskEmail(email: string): string {
++  const at = email.indexOf('@')
++  if (at <= 0) return '***'
++  return `${email[0]}***${email.slice(at)}`
++}
++
++// ── 日期（一律按伦敦自然日）────────────────────────────────────────────────
++
++/** 某个时刻对应的伦敦当地日期。Visit 归日用它，跨午夜算到店那天 */
++export function londonDateOf(at: Date | string): string {
++  return londonToday(typeof at === 'string' ? new Date(at) : at)
++}
++
++/** YYYY-MM-DD 加 n 天，用 UTC 做纯日期运算，不受运行环境时区影响 */
++export function addDays(dateStr: string, days: number): string {
++  const [year, month, day] = dateStr.split('-').map(Number)
++  const d = new Date(Date.UTC(year, month - 1, day + days))
++  return d.toISOString().slice(0, 10)
++}
++
++/** 激活当天算起 30 天含首尾，所以到期日 = 激活日 + 29（PRD 11.2） */
++export function vipExpiresOn(activatedOn: string): string {
++  return addDays(activatedOn, VIP_MONTH_OFFSET_DAYS)
++}
++
++/** 某张 VIP Month 在指定伦敦日期是否生效。激活前不算，到期日当天仍有效 */
++export function isVipBenefitActiveOn(benefit: VipBenefitRow, londonDate: string): boolean {
++  if (!benefit.activated_on || !benefit.expires_on) return false
++  return londonDate >= benefit.activated_on && londonDate <= benefit.expires_on
++}
++
++/** 会员此刻有没有生效中的 VIP Month */
++export function isVipActive(benefits: VipBenefitRow[], londonDate: string): boolean {
++  return benefits.some(b => isVipBenefitActiveOn(b, londonDate))
++}
++
++// ── Visit 口径（与 member_visit_days 视图同口径）────────────────────────────
++
++export interface VisitSessionRow {
++  session_id:      string
++  member_id:       string | null
++  started_at:      string
++  is_settled:      boolean
++  reward_eligible: boolean | null
++}
++
++export interface VisitDay {
++  visit_date:      string
++  reward_eligible: boolean
++}
++
++/**
++ * 把计时单压成「访日」列表，与 SQL 视图 member_visit_days 完全同口径：
++ *   只认有会员归属且已结算的单；按伦敦日期合并；当天只要有一条计入进度就算。
++ */
++export function buildVisitDays(sessions: VisitSessionRow[]): VisitDay[] {
++  const byDate = new Map<string, VisitDay>()
++  for (const s of sessions) {
++    if (!s.member_id || !s.is_settled) continue
++    const date = londonDateOf(s.started_at)
++    const day = byDate.get(date) ?? { visit_date: date, reward_eligible: false }
++    day.reward_eligible = day.reward_eligible || Boolean(s.reward_eligible)
++    byDate.set(date, day)
++  }
++  return [...byDate.values()].sort((a, b) => a.visit_date.localeCompare(b.visit_date))
++}
++
++/** Lifetime Visits：真实到店次数，VIP 期间照常累计（PRD 6.1） */
++export function countLifetimeVisits(visits: VisitDay[]): number {
++  return visits.length
++}
++
++/** Reward Progress：只认计入进度的访日。VIP 期间 Lifetime 加、Progress 不加（PRD 6.2） */
++export function countRewardProgress(visits: VisitDay[]): number {
++  return visits.filter(v => v.reward_eligible).length
++}
++
++// ── 轮次、进度与解锁 ────────────────────────────────────────────────────────
++
++/** 第 cycle 轮第 node 个档位对应的累计 Progress */
++export function rewardThreshold(cycleIndex: number, node: number): number {
++  return REWARD_CYCLE_SIZE * (cycleIndex - 1) + node
++}
++
++export interface UnlockedReward {
++  cycle_index: number
++  reward_type: RewardType
++  threshold:   number
++}
++
++/** 当前 Progress 应该已经解锁的全部奖励。与 ensure_member_rewards 的循环同一个规则 */
++export function unlockedRewardsForProgress(progress: number): UnlockedReward[] {
++  if (progress <= 0) return []
++  const unlocked: UnlockedReward[] = []
++  const cycles = Math.floor((progress - 1) / REWARD_CYCLE_SIZE) + 1
++  for (let cycle = 1; cycle <= cycles; cycle++) {
++    for (const { node, rewardTypes } of CYCLE_REWARD_NODES) {
++      const threshold = rewardThreshold(cycle, node)
++      if (progress < threshold) continue
++      for (const reward_type of rewardTypes) {
++        unlocked.push({ cycle_index: cycle, reward_type, threshold })
++      }
++    }
++  }
++  return unlocked
++}
++
++export interface NextReward {
++  cycle_index: number
++  node:        number
++  threshold:   number
++  remaining:   number
++  rewardTypes: readonly RewardType[]
++}
++
++/** 还差几次到下一个奖励（PRD 7.1 的 "2 more visits to your next reward"） */
++export function nextReward(progress: number): NextReward | null {
++  const cycle = Math.floor(progress / REWARD_CYCLE_SIZE) + 1
++  for (const { node, rewardTypes } of CYCLE_REWARD_NODES) {
++    const threshold = rewardThreshold(cycle, node)
++    if (progress < threshold) {
++      return { cycle_index: cycle, node, threshold, remaining: threshold - progress, rewardTypes }
++    }
++  }
++  return null
++}
++
++/** 十格进度条里当前点亮几格。内部总进度不清零，顾客端按 10 循环显示（PRD 7） */
++export function cycleProgress(progress: number): number {
++  if (progress <= 0) return 0
++  const filled = progress % REWARD_CYCLE_SIZE
++  return filled === 0 ? REWARD_CYCLE_SIZE : filled
++}
++
++export type ProgressCellState = 'done' | 'current' | 'todo'
++
++export interface ProgressCell {
++  index:        number          // 1..10
++  threshold:    number          // 该格对应的累计 Progress
++  isRewardNode: boolean
++  rewardTypes:  readonly RewardType[]
++  state:        ProgressCellState
++}
++
++/** 进度条的十格数据。顾客端不显示 Cycle 1 / Cycle 2 这类技术概念（PRD 7.1） */
++export function progressBarCells(progress: number): ProgressCell[] {
++  const cycle = Math.floor(progress / REWARD_CYCLE_SIZE) + 1
++  const filled = cycleProgress(progress)
++  return Array.from({ length: REWARD_CYCLE_SIZE }, (_, i) => {
++    const index = i + 1
++    const node = CYCLE_REWARD_NODES.find(n => n.node === index)
++    return {
++      index,
++      threshold:    rewardThreshold(cycle, index),
++      isRewardNode: Boolean(node),
++      rewardTypes:  node?.rewardTypes ?? [],
++      state:        index <= filled ? 'done' : index === filled + 1 ? 'current' : 'todo',
++    }
++  })
++}
++
++// ── 奖励可用性 ──────────────────────────────────────────────────────────────
++
++export type RewardState = 'available' | 'used' | 'paused_by_vip' | 'transferred'
++
++export interface RewardAvailability {
++  reward: MemberRewardRow
++  state:  RewardState
++}
++
++/**
++ * 单个奖励当前能不能用。顺序不能变：
++ *   已用 → 已转赠成券（Friend 10% 转赠后不能再用，PRD 10.4）→ VIP 期间暂停（PRD 11.4）→ 可用
++ */
++export function rewardState(reward: MemberRewardRow, vipActive: boolean): RewardState {
++  if (reward.used_at) return 'used'
++  if (reward.reward_type === 'FRIEND_10_OFF' && reward.coupon_id) return 'transferred'
++  if (vipActive) return 'paused_by_vip'
++  return 'available'
++}
++
++/** My Rewards 列表：VIP 期间其他奖励继续显示、只是标成不可用，不隐藏（PRD 11.4、13.1） */
++export function rewardAvailabilityList(
++  rewards: MemberRewardRow[],
++  vipActive: boolean,
++): RewardAvailability[] {
++  return rewards.map(reward => ({ reward, state: rewardState(reward, vipActive) }))
++}
++
++/**
++ * 结算台挑券：同类奖励里挑「最早解锁且未使用」的一张（PRD 9）。
++ * 排序与 SQL 的 ORDER BY unlocked_at, reward_id 保持一致，否则预览与实际核销会对不上。
++ */
++export function pickRewardForUse(
++  rewards: MemberRewardRow[],
++  rewardType: RewardType,
++  vipActive: boolean,
++  excludeSessionId?: string | null,
++): MemberRewardRow | null {
++  const candidates = rewards
++    .filter(r => r.reward_type === rewardType)
++    .filter(r => rewardState(r, vipActive) === 'available')
++    .filter(r => !excludeSessionId || r.reward_id !== excludeSessionId)
++    .sort((a, b) => a.unlocked_at.localeCompare(b.unlocked_at) || a.reward_id.localeCompare(b.reward_id))
++  return candidates[0] ?? null
++}
++
++/** 会员当前可选的奖励类型（去重，供结算台下拉用；PRD 21） */
++export function usableRewardTypes(rewards: MemberRewardRow[], vipActive: boolean): RewardType[] {
++  const types = rewards
++    .filter(r => USABLE_REWARD_TYPES.includes(r.reward_type))
++    .filter(r => rewardState(r, vipActive) === 'available')
++    .map(r => r.reward_type)
++  return [...new Set(types)]
++}
++
++// ── VIP Month ───────────────────────────────────────────────────────────────
++
++export interface VipMonthSummary {
++  active:                VipBenefitRow | null
++  readyToActivate:       number   // 已解锁、尚未激活的 VIP Month 数量（后台要显示）
++  activated:             number
++}
++
++export function vipMonthSummary(
++  rewards: MemberRewardRow[],
++  benefits: VipBenefitRow[],
++  londonDate: string,
++): VipMonthSummary {
++  const vipRewards = rewards.filter(r => r.reward_type === 'VIP_MONTH')
++  const benefitByReward = new Map(benefits.map(b => [b.reward_id, b]))
++  let readyToActivate = 0
++  let activated = 0
++  let active: VipBenefitRow | null = null
++
++  for (const reward of vipRewards) {
++    const benefit = benefitByReward.get(reward.reward_id)
++    if (!benefit || !benefit.activated_on) {
++      readyToActivate += 1
++      continue
++    }
++    activated += 1
++    if (!active && isVipBenefitActiveOn(benefit, londonDate)) active = benefit
++  }
++
++  return { active, readyToActivate, activated }
++}
++
++/**
++ * 能不能再激活一张 VIP Month。同一时间只能有一张生效，且到期后不会自动续（PRD 11.6）。
++ * 多张可累计，未激活的排队等下一次手动激活。
++ */
++export function canActivateVip(
++  benefits: VipBenefitRow[],
++  londonDate: string,
++): { ok: true } | { ok: false; error: 'VIP_ALREADY_ACTIVE' } {
++  const activeCount = benefits.filter(b => isVipBenefitActiveOn(b, londonDate)).length
++  return activeCount >= MAX_ACTIVE_VIP_MONTHS
++    ? { ok: false, error: 'VIP_ALREADY_ACTIVE' }
++    : { ok: true }
++}
++
++// ── 折扣计算 ────────────────────────────────────────────────────────────────
++
++export interface MemberDiscountPreview {
++  source:              DiscountSource
++  rewardType:          RewardType | null
++  discountType:        'fixed_amount' | 'percentage_off'
++  discountValue:       number
++  description:         string
++  preDiscountGbp:      number
++  discountGbp:         number
++  finalGbp:            number
++  discountAmountPence: number
++}
++
++export type MemberDiscountResult =
++  | { ok: true;  preview: MemberDiscountPreview }
++  | { ok: false; error: MemberDiscountError }
++
++export type MemberDiscountError =
++  | 'SESSION_AMOUNT_MISSING'
++  | 'DISCOUNT_SOURCE_INVALID'
++  | 'COUPON_SOURCE_NOT_HANDLED'
++  | 'VIP_MUST_BE_APPLIED'
++  | 'VIP_NOT_ACTIVE'
++  | 'REWARD_TYPE_INVALID'
++
++export interface MemberDiscountContext {
++  amountGbp:  number | null | undefined
++  vipActive:  boolean
++  rewardType?: RewardType | null
++}
++
++/**
++ * 会员折扣的唯一计算入口（与 computeSettlement 并列，互不叠加）。
++ * 错误码与 017 里 settle_timer_session 抛出的错误码同名，前端可以直接按码给文案。
++ */
++export function computeMemberDiscount(
++  source: DiscountSource,
++  ctx: MemberDiscountContext,
++): MemberDiscountResult {
++  if (ctx.amountGbp === null || ctx.amountGbp === undefined) {
++    return { ok: false, error: 'SESSION_AMOUNT_MISSING' }
++  }
++  const prePence = toPence(ctx.amountGbp)
++
++  // VIP 生效期间系统强制走 VIP 折扣，店员不能改用其他会员奖励（PRD 11.4、21）
++  if (ctx.vipActive && source !== 'vip_month') {
++    return { ok: false, error: 'VIP_MUST_BE_APPLIED' }
++  }
++
++  if (source === 'coupon') return { ok: false, error: 'COUPON_SOURCE_NOT_HANDLED' }
++  if (source !== 'none' && source !== 'member_reward' && source !== 'vip_month') {
++    return { ok: false, error: 'DISCOUNT_SOURCE_INVALID' }
++  }
++
++  let rewardType: RewardType | null = null
++  let discountType: 'fixed_amount' | 'percentage_off' = 'fixed_amount'
++  let discountValue = 0
++  let discountPence = 0
++
++  if (source === 'none') {
++    discountPence = 0
++  } else if (source === 'vip_month') {
++    if (!ctx.vipActive) return { ok: false, error: 'VIP_NOT_ACTIVE' }
++    discountType  = 'percentage_off'
++    discountValue = VIP_DISCOUNT_PERCENT
++    discountPence = percentOffPence(prePence, discountValue)
++  } else {
++    const type = ctx.rewardType ?? null
++    if (!type || !USABLE_REWARD_TYPES.includes(type)) {
++      return { ok: false, error: 'REWARD_TYPE_INVALID' }
++    }
++    rewardType = type
++    if (type === 'TWO_POUND') {
++      discountValue = TWO_POUND_PENCE / 100
++      discountPence = Math.min(TWO_POUND_PENCE, prePence)
++    } else if (type === 'FIVE_POUND') {
++      discountValue = FIVE_POUND_PENCE / 100
++      discountPence = Math.min(FIVE_POUND_PENCE, prePence)
++    } else {
++      discountType  = 'percentage_off'
++      discountValue = type === 'PERSONAL_15_OFF' ? PERSONAL_DISCOUNT_PERCENT : FRIEND_DISCOUNT_PERCENT
++      discountPence = percentOffPence(prePence, discountValue)
++    }
++  }
++
++  const finalPence = prePence - discountPence
++  return {
++    ok: true,
++    preview: {
++      source,
++      rewardType,
++      discountType,
++      discountValue,
++      description: source === 'none'
++        ? '不使用会员优惠'
++        : source === 'vip_month'
++          ? `VIP Month ${VIP_DISCOUNT_PERCENT}% OFF`
++          : describeDiscount(discountType, discountValue),
++      preDiscountGbp:      fromPence(prePence),
++      discountGbp:         fromPence(discountPence),
++      finalGbp:            fromPence(finalPence),
++      discountAmountPence: discountPence,
++    },
++  }
++}
++
++/** 百分比折扣：按分四舍五入，与 SQL 的 ROUND(原价 pence × 百分比 / 100) 同口径 */
++export function percentOffPence(prePence: number, percent: number): number {
++  return Math.round(prePence * percent / 100)
++}
+diff --git a/lib/member/service.ts b/lib/member/service.ts
+new file mode 100644
+index 0000000..7de2828
+--- /dev/null
++++ b/lib/member/service.ts
+@@ -0,0 +1,533 @@
++// ============================================================
++// 会员服务端辅助：身份识别与加入、会员页数据、后台动作
++// 规则见《Tangdouren Club 会员系统 PRD v1》第 2、4、12、13、14、16 节
++// 说明：
++//   1) 所有写入都走 service role 客户端（会员三张表只开 RLS、不建策略）。
++//   2) 涉及多表的动作（挂订单、激活 VIP）走 017 里的数据库函数，不在应用层拼事务。
++//   3) 这里只做数据库读写与组装；进度、奖励、折扣的口径一律来自 lib/member/member.ts。
++// ============================================================
++
++import type { SupabaseClient } from '@supabase/supabase-js'
++import {
++  buildVisitDays,
++  isVipActive,
++  londonDateOf,
++  maskEmail,
++  rewardState,
++  USABLE_REWARD_TYPES,
++  nextReward,
++  normalizeMemberEmail,
++  progressBarCells,
++  cycleProgress,
++  countLifetimeVisits,
++  countRewardProgress,
++  isValidMemberEmail,
++  rewardAvailabilityList,
++  vipMonthSummary,
++  type MemberRewardRow,
++  type ProgressCell,
++  type RewardAvailability,
++  type NextReward,
++  type RewardType,
++  type VisitSessionRow,
++  type VipBenefitRow,
++} from './member.ts'
++
++type AdminClient = SupabaseClient
++
++export interface MemberRow {
++  member_id:      string
++  email:          string
++  display_name:   string | null
++  joined_at:      string
++  is_active:      boolean
++}
++
++export type ConsentSource = 'booking' | 'in_store'
++
++// ── 身份：识别与加入 ────────────────────────────────────────────────────────
++
++/** 按 email_key 找会员。查不到返回 null，不报错（PRD 2.3 重复邮箱不报错的同一套思路） */
++export async function findMemberByEmail(admin: AdminClient, email: string): Promise<MemberRow | null> {
++  const emailKey = normalizeMemberEmail(email)
++  if (!emailKey) return null
++
++  const { data, error } = await admin
++    .from('members')
++    .select('member_id, email, display_name, joined_at, is_active')
++    .eq('email_key', emailKey)
++    .maybeSingle()
++
++  if (error) throw new Error('MEMBER_LOOKUP_FAILED')
++  return (data as MemberRow | null) ?? null
++}
++
++export async function findMemberById(admin: AdminClient, memberId: string): Promise<MemberRow | null> {
++  const { data, error } = await admin
++    .from('members')
++    .select('member_id, email, display_name, joined_at, is_active')
++    .eq('member_id', memberId)
++    .maybeSingle()
++
++  if (error) throw new Error('MEMBER_LOOKUP_FAILED')
++  return (data as MemberRow | null) ?? null
++}
++
++export interface EnsureMemberInput {
++  email:         string
++  displayName?:  string | null
++  consentSource: ConsentSource
++}
++
++/**
++ * 加入会员或识别已有会员（PRD 2.3、4.1、4.2）。
++ * 邮箱已存在时不报错、不改姓名，直接返回现有会员；并发同时加入时靠唯一索引兜住，回读现有记录。
++ */
++export async function ensureMember(
++  admin: AdminClient,
++  input: EnsureMemberInput,
++): Promise<{ member: MemberRow; created: boolean }> {
++  const email = typeof input.email === 'string' ? input.email.trim() : ''
++  if (!isValidMemberEmail(email)) throw new Error('INVALID_EMAIL')
++
++  const existing = await findMemberByEmail(admin, email)
++  if (existing) {
++    // 只在原本没有姓名时补上，不覆盖会员自己改过的名字
++    if (!existing.display_name && input.displayName?.trim()) {
++      const name = input.displayName.trim().slice(0, 50)
++      await admin.from('members').update({ display_name: name }).eq('member_id', existing.member_id)
++      existing.display_name = name
++    }
++    return { member: existing, created: false }
++  }
++
++  const { data, error } = await admin
++    .from('members')
++    .insert({
++      email,
++      email_key:      normalizeMemberEmail(email),
++      display_name:   input.displayName?.trim().slice(0, 50) || null,
++      consent_source: input.consentSource,
++    })
++    .select('member_id, email, display_name, joined_at, is_active')
++    .single()
++
++  if (error) {
++    // 23505 = 唯一索引冲突：并发下另一个请求刚建好，回读即可
++    if ((error as { code?: string }).code === '23505') {
++      const raced = await findMemberByEmail(admin, email)
++      if (raced) return { member: raced, created: false }
++    }
++    throw new Error('MEMBER_CREATE_FAILED')
++  }
++
++  return { member: data as MemberRow, created: true }
++}
++
++// ── 会员页数据 ──────────────────────────────────────────────────────────────
++
++export interface MemberVisitEntry {
++  session_id:            string
++  visit_date:            string
++  started_at:            string
++  counted_for_progress:  boolean
++  progress_paused:       boolean          // VIP 期间：Lifetime 加、Progress 不加（PRD 14）
++  used_reward:           RewardType | null
++  used_vip:              boolean
++}
++
++export interface MemberRewardEntry {
++  reward:              MemberRewardRow
++  state:               RewardAvailability['state']
++  cycle_index:         number
++  coupon_code:         string | null
++  coupon_redeemed_at:  string | null
++  benefit:             VipBenefitRow | null
++}
++
++export interface MemberDashboard {
++  member: {
++    member_id:    string
++    display_name: string | null
++    email_masked: string
++    joined_at:    string
++    is_active:    boolean
++  }
++  lifetime_visits: number
++  reward_progress: number
++  cycle_progress:  number
++  next_reward:     NextReward | null
++  progress_cells:  ProgressCell[]
++  rewards:         MemberRewardEntry[]
++  vip:             { active_expires_on: string | null; ready_to_activate: number; activated: number }
++  visit_history:   MemberVisitEntry[]
++}
++
++/** Visit History 与 Reward Progress 的原始数据，PRD 14 要能解释两个数为什么不同 */
++async function loadMemberSessions(admin: AdminClient, memberId: string, limit: number) {
++  const { data, error } = await admin
++    .from('timer_sessions')
++    .select('session_id, member_id, started_at, is_settled, reward_eligible, amount_gbp, actual_amount_gbp')
++    .eq('member_id', memberId)
++    .order('started_at', { ascending: false })
++    .limit(limit)
++
++  if (error) throw new Error('MEMBER_SESSIONS_FAILED')
++  return (data ?? []) as (VisitSessionRow & { amount_gbp: number | null })[]
++}
++
++export async function getMemberDashboard(
++  admin: AdminClient,
++  memberId: string,
++  options: { visitLimit?: number; londonToday: string },
++): Promise<MemberDashboard | null> {
++  const member = await findMemberById(admin, memberId)
++  if (!member) return null
++
++  const sessions = await loadMemberSessions(admin, memberId, 500)
++
++  const { data: rewardRows, error: rewardErr } = await admin
++    .from('member_rewards')
++    .select('reward_id, member_id, reward_type, cycle_index, unlocked_at, coupon_id, used_at, used_session_id')
++    .eq('member_id', memberId)
++    .order('unlocked_at', { ascending: true })
++
++  if (rewardErr) throw new Error('MEMBER_REWARDS_FAILED')
++  const rewards = (rewardRows ?? []) as (MemberRewardRow & { used_session_id: string | null })[]
++
++  const { data: benefitRows, error: benefitErr } = await admin
++    .from('member_benefits')
++    .select('benefit_id, reward_id, activated_on, expires_on')
++    .eq('member_id', memberId)
++    .order('activated_on', { ascending: true })
++
++  if (benefitErr) throw new Error('MEMBER_BENEFITS_FAILED')
++  const benefits = (benefitRows ?? []) as VipBenefitRow[]
++
++  const couponIds = rewards.map(r => r.coupon_id).filter((id): id is string => Boolean(id))
++  const couponById = new Map<string, { code: string; redeemed_at: string | null }>()
++  if (couponIds.length > 0) {
++    const { data: couponRows } = await admin
++      .from('coupons')
++      .select('coupon_id, code, redeemed_at')
++      .in('coupon_id', couponIds)
++    for (const c of couponRows ?? []) {
++      couponById.set(c.coupon_id as string, { code: c.code as string, redeemed_at: c.redeemed_at as string | null })
++    }
++  }
++
++  const vipActive   = isVipActive(benefits, options.londonToday)
++  const visits      = buildVisitDays(sessions)
++  const progress    = countRewardProgress(visits)
++  const usedBySession = new Map(rewards.filter(r => r.used_session_id).map(r => [r.used_session_id as string, r.reward_type]))
++  const vipSummary  = vipMonthSummary(rewards, benefits, options.londonToday)
++
++  const limit = options.visitLimit ?? 10
++  const visitHistory: MemberVisitEntry[] = sessions
++    .filter(s => s.is_settled)
++    .slice(0, limit)
++    .map(s => ({
++      session_id:           s.session_id,
++      visit_date:           londonDateOf(s.started_at),
++      started_at:           s.started_at,
++      counted_for_progress: Boolean(s.reward_eligible),
++      progress_paused:      s.reward_eligible === false,
++      used_reward:          usedBySession.get(s.session_id) ?? null,
++      used_vip:             s.reward_eligible === false,
++    }))
++
++  return {
++    member: {
++      member_id:    member.member_id,
++      display_name: member.display_name,
++      email_masked: maskEmail(member.email),
++      joined_at:    member.joined_at,
++      is_active:    member.is_active,
++    },
++    lifetime_visits: countLifetimeVisits(visits),
++    reward_progress: progress,
++    cycle_progress:  cycleProgress(progress),
++    next_reward:     nextReward(progress),
++    progress_cells:  progressBarCells(progress),
++    rewards: rewards.map(reward => ({
++      reward,
++      state:              rewardAvailabilityList([reward], vipActive)[0].state,
++      cycle_index:        reward.cycle_index,
++      coupon_code:        reward.coupon_id ? couponById.get(reward.coupon_id)?.code ?? null : null,
++      coupon_redeemed_at: reward.coupon_id ? couponById.get(reward.coupon_id)?.redeemed_at ?? null : null,
++      benefit:            benefits.find(b => b.reward_id === reward.reward_id) ?? null,
++    })),
++    vip: {
++      active_expires_on: vipSummary.active?.expires_on ?? null,
++      ready_to_activate: vipSummary.readyToActivate,
++      activated:         vipSummary.activated,
++    },
++    visit_history: visitHistory,
++  }
++}
++
++
++// ── 结算台需要的数据 ────────────────────────────────────────────────────────
++
++export interface MemberSettleInfo {
++  member:        MemberRow
++  vipActive:     boolean
++  vipExpiresOn:  string | null
++  usableTypes:   RewardType[]
++  rewards:       MemberRewardRow[]
++}
++
++/**
++ * 结算台要用的一小块数据：会员是否有生效中的 VIP、当前能选哪些奖励。
++ * 金额与资格最终由数据库复核，这里只负责给店员看的那一份预览（PRD 21）。
++ */
++export async function getMemberSettleInfo(
++  admin: AdminClient,
++  memberId: string,
++  londonToday: string,
++): Promise<MemberSettleInfo | null> {
++  const member = await findMemberById(admin, memberId)
++  if (!member) return null
++
++  const { data: rewardRows } = await admin
++    .from('member_rewards')
++    .select('reward_id, member_id, reward_type, cycle_index, unlocked_at, coupon_id, used_at')
++    .eq('member_id', memberId)
++    .order('unlocked_at', { ascending: true })
++
++  const { data: benefitRows } = await admin
++    .from('member_benefits')
++    .select('benefit_id, reward_id, activated_on, expires_on')
++    .eq('member_id', memberId)
++
++  const rewards   = (rewardRows ?? []) as MemberRewardRow[]
++  const benefits  = (benefitRows ?? []) as VipBenefitRow[]
++  const vipActive = isVipActive(benefits, londonToday)
++  const activeBenefit = benefits.find(b => isVipActive([b], londonToday)) ?? null
++
++  return {
++    member,
++    vipActive,
++    vipExpiresOn: activeBenefit?.expires_on ?? null,
++    usableTypes:  rewards.filter(r => USABLE_REWARD_TYPES.includes(r.reward_type))
++                         .filter(r => rewardState(r, vipActive) === 'available')
++                         .map(r => r.reward_type)
++                         .filter((t, i, arr) => arr.indexOf(t) === i),
++    rewards,
++  }
++}
++
++// ── 错误文案 ────────────────────────────────────────────────────────────────
++
++/** 把数据库函数与会员服务抛出的标记转成中文提示，不向前端暴露原始数据库错误 */
++export function mapMemberError(message: string | undefined | null): string {
++  const raw = message ?? ''
++  const table: [string, string][] = [
++    ['MEMBER_NOT_FOUND',                '找不到该会员'],
++    ['MEMBER_INACTIVE',                 '该会员已被停用，请联系店员'],
++    ['INVALID_EMAIL',                   '请输入有效的邮箱地址'],
++    ['INVALID_NAME',                    '请填写姓名'],
++    ['MEMBER_CREATE_FAILED',            '加入失败，请重试'],
++    ['MEMBER_LOOKUP_FAILED',            '查询失败，请重试'],
++    ['MEMBER_UPDATE_FAILED',            '更新失败，请重试'],
++    ['MEMBER_SESSIONS_FAILED',          '读取到店记录失败，请重试'],
++    ['MEMBER_REWARDS_FAILED',           '读取奖励失败，请重试'],
++    ['MEMBER_BENEFITS_FAILED',          '读取 VIP 记录失败，请重试'],
++    ['MEMBER_LIST_FAILED',              '读取会员列表失败，请重试'],
++    ['SESSION_NOT_FOUND',               '计时订单不存在'],
++    ['SESSION_ALREADY_SETTLED',         '该订单已结算，请先撤销结算再关联会员'],
++    ['MEMBER_REQUIRED',                 '该订单没有关联会员'],
++    ['MEMBER_SESSION_MISMATCH',         '这类奖励只能用于本人的订单，请先把订单关联到会员'],
++    ['MEMBER_REWARD_NOT_FOUND',         '找不到该奖励'],
++    ['MEMBER_REWARD_UNAVAILABLE',       '该会员当前没有可用的这类奖励'],
++    ['MEMBER_REWARD_ALREADY_USED',      '该奖励已经用过了'],
++    ['MEMBER_REWARD_ALREADY_TRANSFERRED', '这张朋友券已经关联过优惠券了'],
++    ['MEMBER_REWARD_COUPON_USED',       '该奖励对应的内部券已经被使用'],
++    ['MEMBER_REWARD_UPDATE_FAILED',     '奖励更新失败，请重试'],
++    ['REWARD_TYPE_INVALID',             '奖励类型无效'],
++    ['REWARD_ALREADY_USED',             '这个订单解锁的奖励已经被用掉了，需要管理员处理'],
++    ['MEMBER_BENEFIT_NOT_FOUND',        '这张 VIP Month 的状态异常，请联系管理员'],
++    ['VIP_MUST_BE_APPLIED',             'VIP 生效期间系统自动使用 VIP 85 折，不能改用其他会员优惠'],
++    ['VIP_NOT_ACTIVE',                  '该会员当前没有生效中的 VIP Month'],
++    ['VIP_ALREADY_ACTIVE',              '当前已有生效中的 VIP Month，等它到期后再激活下一张'],
++    ['VIP_ALREADY_ACTIVATED',           '这张 VIP Month 已经激活过了'],
++    ['MULTIPLE_DISCOUNT_SOURCES',       '一个订单只能使用一种优惠'],
++    ['DISCOUNT_SOURCE_INVALID',         '优惠类型无效'],
++    ['DISCOUNT_AMOUNT_INVALID',         '优惠金额异常，请重新选择'],
++    ['MEMBER_DISCOUNT_MISMATCH',        '会员优惠金额校验未通过，请刷新后重试'],
++    ['MEMBER_DISCOUNT_MISSING',         '会员优惠金额缺失，请重新选择'],
++    ['COUPON_NOT_TEN_PERCENT',          '只能关联 10% OFF 的优惠券'],
++    ['COUPON_NOT_FOUND',                '优惠码不存在'],
++    ['COUPON_ALREADY_USED',             '该优惠券已被使用'],
++  ]
++  for (const [code, text] of table) {
++    if (raw.includes(code)) return text
++  }
++  return '操作失败，请重试'
++}
++
++
++// ── 后台 ────────────────────────────────────────────────────────────────────
++
++export interface MemberListItem extends MemberRow {
++  lifetime_visits: number
++  reward_progress: number
++}
++
++/** 后台会员列表，可按姓名或邮箱搜索（PRD 16.1） */
++export async function listMembers(
++  admin: AdminClient,
++  options: { search?: string | null; limit?: number },
++): Promise<MemberListItem[]> {
++  let query = admin
++    .from('members')
++    .select('member_id, email, display_name, joined_at, is_active')
++    .order('joined_at', { ascending: false })
++    .limit(options.limit ?? 50)
++
++  const search = options.search?.trim()
++  if (search) {
++    const escaped = search.replace(/[%,()]/g, '')
++    query = query.or(`display_name.ilike.%${escaped}%,email.ilike.%${escaped}%`)
++  }
++
++  const { data, error } = await query
++  if (error) throw new Error('MEMBER_LIST_FAILED')
++
++  const members = (data ?? []) as MemberRow[]
++  if (members.length === 0) return []
++
++  const { data: sessionRows } = await admin
++    .from('timer_sessions')
++    .select('member_id, started_at, is_settled, reward_eligible')
++    .in('member_id', members.map(m => m.member_id))
++
++  const byMember = new Map<string, VisitSessionRow[]>()
++  for (const row of (sessionRows ?? []) as VisitSessionRow[]) {
++    const list = byMember.get(row.member_id as string) ?? []
++    list.push(row)
++    byMember.set(row.member_id as string, list)
++  }
++
++  return members.map(member => {
++    const visits = buildVisitDays(byMember.get(member.member_id) ?? [])
++    return {
++      ...member,
++      lifetime_visits: countLifetimeVisits(visits),
++      reward_progress: countRewardProgress(visits),
++    }
++  })
++}
++
++/** 把散客订单挂到会员名下（PRD 5.2、16.2）。走数据库函数，保证两个字段一起落 */
++export async function linkSessionToMember(
++  admin: AdminClient,
++  sessionId: string,
++  memberId: string,
++): Promise<{ ok: true } | { ok: false; error: string }> {
++  const { error } = await admin.rpc('link_timer_session_to_member', {
++    p_session_id: sessionId,
++    p_member_id:  memberId,
++  })
++  return error ? { ok: false, error: error.message } : { ok: true }
++}
++
++/** 激活 VIP Month（PRD 11.1）。会员端与后台共用同一个数据库函数 */
++export async function activateVipMonth(
++  admin: AdminClient,
++  rewardId: string,
++  activatedBy: string,
++): Promise<{ ok: true; benefit: unknown } | { ok: false; error: string }> {
++  const { data, error } = await admin.rpc('activate_member_vip', {
++    p_reward_id:    rewardId,
++    p_activated_by: activatedBy,
++  })
++  return error ? { ok: false, error: error.message } : { ok: true, benefit: data }
++}
++
++/**
++ * 把 Friend 10% Reward 关联到一张已经生成的普通 10% 优惠券（PRD 10.4）。
++ * 关联后该奖励不能再走会员通道直接核销，朋友之后凭券码正常核销。
++ */
++export async function associateFriendRewardCoupon(
++  admin: AdminClient,
++  rewardId: string,
++  couponCode: string,
++): Promise<{ ok: true } | { ok: false; error: string }> {
++  const code = couponCode.trim().toUpperCase()
++  if (!code) return { ok: false, error: 'COUPON_CODE_REQUIRED' }
++
++  const { data: reward, error: rewardErr } = await admin
++    .from('member_rewards')
++    .select('reward_id, reward_type, coupon_id, used_at, member_id')
++    .eq('reward_id', rewardId)
++    .maybeSingle()
++
++  if (rewardErr) return { ok: false, error: 'MEMBER_REWARD_LOOKUP_FAILED' }
++  if (!reward) return { ok: false, error: 'MEMBER_REWARD_NOT_FOUND' }
++  if (reward.reward_type !== 'FRIEND_10_OFF') return { ok: false, error: 'REWARD_TYPE_INVALID' }
++  if (reward.coupon_id) return { ok: false, error: 'MEMBER_REWARD_ALREADY_TRANSFERRED' }
++  if (reward.used_at) return { ok: false, error: 'MEMBER_REWARD_ALREADY_USED' }
++
++  const { data: coupon, error: couponErr } = await admin
++    .from('coupons')
++    .select('coupon_id, discount_type, discount_value, redeemed_at')
++    .eq('code', code)
++    .maybeSingle()
++
++  if (couponErr) return { ok: false, error: 'COUPON_LOOKUP_FAILED' }
++  if (!coupon) return { ok: false, error: 'COUPON_NOT_FOUND' }
++  if (coupon.discount_type !== 'percentage_off' || Number(coupon.discount_value) !== 10) {
++    return { ok: false, error: 'COUPON_NOT_TEN_PERCENT' }
++  }
++  if (coupon.redeemed_at) return { ok: false, error: 'COUPON_ALREADY_USED' }
++
++  // 条件更新：coupon_id 为空才写，防并发重复关联
++  const { data: updated, error: updateErr } = await admin
++    .from('member_rewards')
++    .update({ coupon_id: coupon.coupon_id })
++    .eq('reward_id', rewardId)
++    .is('coupon_id', null)
++    .select('reward_id')
++
++  if (updateErr) return { ok: false, error: 'MEMBER_REWARD_UPDATE_FAILED' }
++  if (!updated || updated.length === 0) return { ok: false, error: 'MEMBER_REWARD_ALREADY_TRANSFERRED' }
++  return { ok: true }
++}
++
++/** 停用 / 恢复会员（PRD 16.2）。后台唯一能改的会员字段 */
++export async function setMemberActive(
++  admin: AdminClient,
++  memberId: string,
++  isActive: boolean,
++): Promise<{ ok: true } | { ok: false; error: string }> {
++  const { data, error } = await admin
++    .from('members')
++    .update({ is_active: isActive })
++    .eq('member_id', memberId)
++    .select('member_id')
++
++  if (error) return { ok: false, error: 'MEMBER_UPDATE_FAILED' }
++  if (!data || data.length === 0) return { ok: false, error: 'MEMBER_NOT_FOUND' }
++  return { ok: true }
++}
++
++/** 会员姓名可由会员自行修改（PRD 2.2），后台不提供改邮箱 */
++export async function updateMemberName(
++  admin: AdminClient,
++  memberId: string,
++  displayName: string,
++): Promise<{ ok: true } | { ok: false; error: string }> {
++  const name = displayName.trim().slice(0, 50)
++  if (!name) return { ok: false, error: 'INVALID_NAME' }
++
++  const { data, error } = await admin
++    .from('members')
++    .update({ display_name: name })
++    .eq('member_id', memberId)
++    .select('member_id')
++
++  if (error) return { ok: false, error: 'MEMBER_UPDATE_FAILED' }
++  if (!data || data.length === 0) return { ok: false, error: 'MEMBER_NOT_FOUND' }
++  return { ok: true }
++}
+diff --git a/lib/timer/selfService.ts b/lib/timer/selfService.ts
+index 200f266..d0e44f2 100644
+--- a/lib/timer/selfService.ts
++++ b/lib/timer/selfService.ts
+@@ -1,6 +1,7 @@
+ import { createAdminClient } from '@/lib/supabase/admin'
+ import { generateTimerSessionId } from '@/lib/timer/sessionId'
+ import { normalizeSeatCode, normalizeTableCode, normalizeSeatForLookup, SELF_SERVICE_TABLE_CODES } from '@/lib/timer/selfServiceCore'
++import { findMemberByEmail } from '@/lib/member/service'
+ 
+ type AdminClient = ReturnType<typeof createAdminClient>
+ 
+@@ -70,6 +71,8 @@ export interface StartSelfTimerInput {
+   customerName?: string
+   confirmNoMixedBeans: boolean
+   idempotencyKey?: string
++  /** 顾客选了「以会员身份开始」时带上的邮箱。查不到或已停用都按普通顾客处理，不阻断计时（PRD 3.1） */
++  memberEmail?: string
+ }
+ 
+ export async function startSelfTimer(admin: AdminClient, input: StartSelfTimerInput) {
+@@ -91,19 +94,36 @@ export async function startSelfTimer(admin: AdminClient, input: StartSelfTimerIn
+     if (existingByKey?.session_id) return { sessionId: existingByKey.session_id as string, restored: true }
+   }
+ 
++  // 会员归属在创建计时单时写入（PRD 5.1）。查询失败也不阻断，最多是这一次没算上
++  let memberId: string | null = null
++  if (input.memberEmail?.trim()) {
++    try {
++      const member = await findMemberByEmail(admin, input.memberEmail)
++      if (member?.is_active) memberId = member.member_id
++    } catch (lookupErr) {
++      console.error('[startSelfTimer] 会员查询失败，按普通计时继续:', lookupErr instanceof Error ? lookupErr.message : lookupErr)
++    }
++  }
++
+   const sessionId = await generateTimerSessionId(admin)
++
++  // member_id 只在真的解析出会员时才写进 insert：会员表迁移还没上的环境里，
++  // 这一列不存在，写 null 也会让普通计时整条失败，那就得不偿失了。
++  const payload: Record<string, unknown> = {
++    session_id: sessionId,
++    booking_id: null,
++    customer_name: customerName,
++    table_number: seatNumber,
++    status: 'running',
++    started_at: new Date().toISOString(),
++    created_via: 'self_service',
++    idempotency_key: input.idempotencyKey ?? null,
++  }
++  if (memberId) payload.member_id = memberId
++
+   const { data, error } = await admin
+     .from('timer_sessions')
+-    .insert({
+-      session_id: sessionId,
+-      booking_id: null,
+-      customer_name: customerName,
+-      table_number: seatNumber,
+-      status: 'running',
+-      started_at: new Date().toISOString(),
+-      created_via: 'self_service',
+-      idempotency_key: input.idempotencyKey ?? null,
+-    })
++    .insert(payload)
+     .select('session_id')
+     .single()
+ 
+diff --git a/supabase/migrations/016_members.sql b/supabase/migrations/016_members.sql
+new file mode 100644
+index 0000000..78c4b6c
+--- /dev/null
++++ b/supabase/migrations/016_members.sql
+@@ -0,0 +1,99 @@
++-- ============================================================
++-- Tangdouren Club 会员系统 v1.2 — 第 1 步：会员主表与消费归属
++--
++-- 范围：
++--   1) 新建 members 表（会员身份 + 加入同意记录）
++--   2) timer_sessions 增加 member_id（消费归属）与 reward_eligible（结算进度资格）
++--   3) RLS：与 timer_sessions 一致，全部走 service role
++--
++-- 说明：
++--   1) 会员以邮箱为自然键。email 保留顾客原始输入，email_key 存
++--      lower(btrim(email)) 并做唯一键，避免大小写 / 空格造出同一个人两条记录。
++--   2) 不生成会员码。现场识别由店员在结算台按邮箱或姓名搜索会员完成。
++--   3) Visit 不落计数器，由「有会员归属且已结算」的订单派生
++--      （视图 member_visit_days 建在 017）。
++--   4) 删除会员的处理方式：删除 members 行，member_id 经 ON DELETE SET NULL
++--      自动断开，订单与金额保留不动（对应 UK GDPR 的删除请求）。
++--   5) bookings 不加 member_id：预约上的会员身份不自动传递到 timer session，
++--      预约邮箱只用于后台标注「这个人已经是会员」，因此只给 bookings.email
++--      加一条规范化索引。
++-- ============================================================
++
++-- ── 1. members ───────────────────────────────────────────────────────────────
++
++CREATE TABLE IF NOT EXISTS members (
++  member_id      uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
++  email          text        NOT NULL,               -- 顾客原始输入
++  email_key      text        NOT NULL,               -- lower(btrim(email))，唯一键
++  display_name   text,                               -- 姓名，供结算台搜索与展示
++  joined_at      timestamptz NOT NULL DEFAULT NOW(), -- 加入会员时刻
++  consent_at     timestamptz NOT NULL DEFAULT NOW(), -- 同意加入的时刻（留证）
++  consent_source text        NOT NULL,               -- booking | in_store
++  note           text,                               -- 店员备注
++  is_active      boolean     NOT NULL DEFAULT true   -- 退会置 false，不删记录
++);
++
++-- 邮箱形状：必须有 @ 且 @ 后要有域名点号
++ALTER TABLE members DROP CONSTRAINT IF EXISTS members_email_shape_check;
++ALTER TABLE members ADD CONSTRAINT members_email_shape_check
++  CHECK (
++    position('@' IN email) > 1
++    AND position('.' IN split_part(email, '@', 2)) > 1
++  );
++
++-- email_key 必须真的是 email 的小写去空格形式，防止某条写入路径漏规范化
++ALTER TABLE members DROP CONSTRAINT IF EXISTS members_email_key_check;
++ALTER TABLE members ADD CONSTRAINT members_email_key_check
++  CHECK (email_key = lower(btrim(email)) AND btrim(email_key) <> '');
++
++-- 同意来源只能是这两个入口（预约页勾选 / 门店登记）
++ALTER TABLE members DROP CONSTRAINT IF EXISTS members_consent_source_check;
++ALTER TABLE members ADD CONSTRAINT members_consent_source_check
++  CHECK (consent_source IN ('booking', 'in_store'));
++
++-- 一个邮箱一个人
++CREATE UNIQUE INDEX IF NOT EXISTS idx_members_email_key ON members(email_key);
++
++CREATE INDEX IF NOT EXISTS idx_members_joined_at   ON members(joined_at DESC);
++CREATE INDEX IF NOT EXISTS idx_members_name_lookup ON members(lower(display_name));
++
++-- RLS：与 014 对 timer_sessions 的处理一致 —— 只启用、不建策略。
++-- 应用访问全部走 service role（lib/supabase/admin.ts），anon / authenticated
++-- 拿公开的 publishable key 读不到任何会员数据。
++ALTER TABLE members ENABLE ROW LEVEL SECURITY;
++
++-- ── 2. 消费归属字段 ──────────────────────────────────────────────────────────
++
++-- 到店消费的归属：会员在自助计时页以会员身份开始时写入，或由店员在结算台补 Link
++ALTER TABLE timer_sessions
++  ADD COLUMN IF NOT EXISTS member_id uuid REFERENCES members(member_id) ON DELETE SET NULL;
++
++-- 本次消费是否计入 Reward Progress，在结算时固化，不在查询时按日期重推：
++--   true  = 有会员归属，且结算那一刻该会员没有生效中的 VIP Month
++--   false = 不计入（结算时 VIP 正在生效）
++--   NULL  = 尚未判定（未结算的订单、以及本迁移之前的历史订单）
++-- 之所以固化而不是现算：VIP Month 从激活那一刻起暂停进度，事后按日期重推会把
++-- 激活当天早些时候已经完成的消费一起误伤掉。
++ALTER TABLE timer_sessions
++  ADD COLUMN IF NOT EXISTS reward_eligible boolean;
++
++-- 只有归属到会员的单才可能计入奖励进度，防止某条写入路径把 true 写到散客单上
++ALTER TABLE timer_sessions DROP CONSTRAINT IF EXISTS timer_sessions_reward_eligible_check;
++ALTER TABLE timer_sessions ADD CONSTRAINT timer_sessions_reward_eligible_check
++  CHECK (reward_eligible IS NOT TRUE OR member_id IS NOT NULL);
++
++-- Visit 与 Reward Progress 都按 (member_id, is_settled) 过滤，这条索引直接服务该查询
++CREATE INDEX IF NOT EXISTS idx_timer_sessions_member ON timer_sessions(member_id, is_settled);
++
++-- 预约时按邮箱认会员，查询对大小写与首尾空格不敏感
++CREATE INDEX IF NOT EXISTS idx_bookings_email_key    ON bookings(lower(btrim(email)));
++
++-- ============================================================
++-- ROLLBACK：
++--   DROP INDEX IF EXISTS idx_bookings_email_key;
++--   DROP INDEX IF EXISTS idx_timer_sessions_member;
++--   ALTER TABLE timer_sessions DROP CONSTRAINT IF EXISTS timer_sessions_reward_eligible_check;
++--   ALTER TABLE timer_sessions DROP COLUMN IF EXISTS reward_eligible;
++--   ALTER TABLE timer_sessions DROP COLUMN IF EXISTS member_id;
++--   DROP TABLE IF EXISTS members;
++-- ============================================================
+diff --git a/supabase/migrations/017_member_settlement.sql b/supabase/migrations/017_member_settlement.sql
+new file mode 100644
+index 0000000..9d86e03
+--- /dev/null
++++ b/supabase/migrations/017_member_settlement.sql
+@@ -0,0 +1,814 @@
++--  
++-- NOTE: the head of this file is kept ASCII-only on purpose.
++-- Tooling that sniffs the first 8192 bytes as UTF-8 misreads a file whose
++-- multibyte characters straddle that boundary. Do not reorder this header
++-- without re-checking that the file is still seen as text.
++-- ============================================================
++-- Tangdouren Club 会员系统 v1.2 — 第 3 步：奖励引擎与结算接入
++-- 依据：《Tangdouren Club 会员系统 PRD v1》第 6、7、9、10、11、18、19、20、21 节
++--
++-- 范围：
++--   1) 新表 member_rewards（奖励解锁与核销）与 member_benefits（VIP Month）
++--   2) 新视图 member_visit_days（Lifetime Visits 与 Reward Progress 的唯一口径）
++--   3) 新函数 member_vip_active()、ensure_member_rewards()
++--   4) 扩展 settle_timer_session / unsettle_timer_session，接入会员折扣
++--   5) 后台动作函数 link_timer_session_to_member()、activate_member_vip()
++--
++-- 设计要点：
++--   1) 进度不落计数器。Lifetime Visits = 会员已结算订单的伦敦日期去重计数；
++--      Reward Progress = 同样的计数但只认 reward_eligible 为真的访日（PRD 20）。
++--   2) 解锁幂等靠 UNIQUE(member_id, reward_type, cycle_index) + ON CONFLICT DO NOTHING，
++--      重复结算或并发调用都不会多发一张（PRD 19.3）。
++--   3) 折扣来源是单选枚举（none / coupon / member_reward / vip_month），从结构上排除叠加（PRD 21）。
++--   4) 金额仍由 TypeScript 先算（lib/coupon/coupon.ts），SQL 用自己查到的券或奖励记录复核，
++--      对不上抛错。**改动折扣逻辑必须同时改这两处**，否则会出现预览金额与最终结算不一致。
++-- ============================================================
++
++-- ── 1. member_rewards ────────────────────────────────────────────────────────
++-- 一条记录 = 一张已经解锁的奖励。券类奖励（£2 / £5）在解锁时同步生成内部券，
++-- 券码不向顾客展示，只作为结算台核销的凭据。
++
++CREATE TABLE IF NOT EXISTS member_rewards (
++  reward_id              uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
++  member_id              uuid        NOT NULL REFERENCES members(member_id) ON DELETE CASCADE,
++  reward_type            text        NOT NULL,
++  cycle_index            integer     NOT NULL,
++  unlocked_at            timestamptz NOT NULL DEFAULT NOW(),
++  unlocked_by_session_id text        REFERENCES timer_sessions(session_id) ON DELETE SET NULL,
++  coupon_id              uuid        REFERENCES coupons(coupon_id) ON DELETE RESTRICT,
++  used_at                timestamptz,
++  used_by                text,
++  used_session_id        text        REFERENCES timer_sessions(session_id) ON DELETE RESTRICT
++);
++
++ALTER TABLE member_rewards DROP CONSTRAINT IF EXISTS member_rewards_type_check;
++ALTER TABLE member_rewards ADD CONSTRAINT member_rewards_type_check
++  CHECK (reward_type IN ('TWO_POUND', 'FIVE_POUND', 'PERSONAL_15_OFF', 'FRIEND_10_OFF', 'VIP_MONTH'));
++
++-- 轮次从 1 开始（判定式 10 ×(轮次 - 1) + 档位，见 PRD 7）
++ALTER TABLE member_rewards DROP CONSTRAINT IF EXISTS member_rewards_cycle_check;
++ALTER TABLE member_rewards ADD CONSTRAINT member_rewards_cycle_check
++  CHECK (cycle_index >= 1);
++
++-- 核销字段要么全空，要么成组出现（与 coupons 的处理一致）
++ALTER TABLE member_rewards DROP CONSTRAINT IF EXISTS member_rewards_used_check;
++ALTER TABLE member_rewards ADD CONSTRAINT member_rewards_used_check
++  CHECK (
++    (used_at IS NULL     AND used_by IS NULL     AND used_session_id IS NULL)
++    OR
++    (used_at IS NOT NULL AND used_by IS NOT NULL AND used_session_id IS NOT NULL)
++  );
++
++-- coupon_id 的含义按奖励类型区分（PRD 19.4）：
++--   TWO_POUND / FIVE_POUND  ：解锁时由系统生成的内部券，必定存在
++--   PERSONAL_15_OFF / VIP_MONTH：不可转赠，不允许挂券
++--   FRIEND_10_OFF           ：空 = 仍可直接用于朋友；非空 = 已转赠为普通券，不能再直接使用
++ALTER TABLE member_rewards DROP CONSTRAINT IF EXISTS member_rewards_coupon_check;
++ALTER TABLE member_rewards ADD CONSTRAINT member_rewards_coupon_check
++  CHECK (
++    (reward_type IN ('PERSONAL_15_OFF', 'VIP_MONTH') AND coupon_id IS NULL)
++    OR (reward_type IN ('TWO_POUND', 'FIVE_POUND') AND coupon_id IS NOT NULL)
++    OR reward_type = 'FRIEND_10_OFF'
++  );
++
++-- 已转赠成券的 Friend Reward 不允许再被会员通道直接核销（PRD 10.4）
++ALTER TABLE member_rewards DROP CONSTRAINT IF EXISTS member_rewards_friend_transfer_check;
++ALTER TABLE member_rewards ADD CONSTRAINT member_rewards_friend_transfer_check
++  CHECK (NOT (reward_type = 'FRIEND_10_OFF' AND coupon_id IS NOT NULL AND used_at IS NOT NULL));
++
++-- 解锁幂等：同一会员同一轮同一档位只可能有一条
++CREATE UNIQUE INDEX IF NOT EXISTS idx_member_rewards_idempotent
++  ON member_rewards(member_id, reward_type, cycle_index);
++
++-- 结算台挑券：按会员 + 类型找「最早解锁且未使用」的一张
++CREATE INDEX IF NOT EXISTS idx_member_rewards_available
++  ON member_rewards(member_id, reward_type, used_at);
++
++-- 撤销结算要能反查「这一单解锁了哪些奖励」「这一单用了哪张奖励」
++CREATE INDEX IF NOT EXISTS idx_member_rewards_unlocked_by
++  ON member_rewards(unlocked_by_session_id) WHERE unlocked_by_session_id IS NOT NULL;
++CREATE INDEX IF NOT EXISTS idx_member_rewards_used_session
++  ON member_rewards(used_session_id) WHERE used_session_id IS NOT NULL;
++
++-- RLS：照 014 / 016 的处理，只启用、不建策略，应用全走 service role
++ALTER TABLE member_rewards ENABLE ROW LEVEL SECURITY;
++
++-- ── 2. member_benefits（VIP Month）───────────────────────────────────────────
++-- 一个会员可以累计多张 VIP Month，但同一时间最多一张生效（PRD 11.6）。
++-- activated_on 为空 = 已解锁、尚未激活；到期与否由日期派生，不存状态字段。
++
++CREATE TABLE IF NOT EXISTS member_benefits (
++  benefit_id   uuid        PRIMARY KEY DEFAULT gen_random_uuid(),
++  member_id    uuid        NOT NULL REFERENCES members(member_id) ON DELETE CASCADE,
++  reward_id    uuid        NOT NULL REFERENCES member_rewards(reward_id) ON DELETE CASCADE,
++  activated_on date,
++  activated_at timestamptz,
++  expires_on   date,
++  activated_by text
++);
++
++-- 一个 VIP 奖励只对应一条权益记录
++CREATE UNIQUE INDEX IF NOT EXISTS idx_member_benefits_reward
++  ON member_benefits(reward_id);
++
++-- 有效期 30 天含首尾：expires_on = activated_on + 29（PRD 11.2）
++ALTER TABLE member_benefits DROP CONSTRAINT IF EXISTS member_benefits_expiry_check;
++ALTER TABLE member_benefits ADD CONSTRAINT member_benefits_expiry_check
++  CHECK (activated_on IS NULL OR expires_on = activated_on + 29);
++
++-- 激活字段要么全空，要么成组出现
++ALTER TABLE member_benefits DROP CONSTRAINT IF EXISTS member_benefits_activation_check;
++ALTER TABLE member_benefits ADD CONSTRAINT member_benefits_activation_check
++  CHECK (
++    (activated_on IS NULL AND activated_at IS NULL AND expires_on IS NULL AND activated_by IS NULL)
++    OR
++    (activated_on IS NOT NULL AND activated_at IS NOT NULL AND expires_on IS NOT NULL AND activated_by IS NOT NULL)
++  );
++
++CREATE INDEX IF NOT EXISTS idx_member_benefits_member ON member_benefits(member_id, activated_on);
++
++ALTER TABLE member_benefits ENABLE ROW LEVEL SECURITY;
++
++-- ── 3. 口径函数与视图 ────────────────────────────────────────────────────────
++
++-- VIP 是否在某个时刻生效。伦敦自然日、含首尾（PRD 11.2）。
++-- 结算、会员页、后台都走这一个定义，避免三处各写一份日期判断。
++CREATE OR REPLACE FUNCTION public.member_vip_active(
++  p_member_id uuid,
++  p_at        timestamptz DEFAULT NOW()
++) RETURNS boolean
++LANGUAGE sql
++STABLE
++SET search_path = public
++AS $$
++  SELECT EXISTS (
++    SELECT 1
++      FROM member_benefits b
++     WHERE b.member_id = p_member_id
++       AND b.activated_on IS NOT NULL
++       AND (p_at AT TIME ZONE 'Europe/London')::date BETWEEN b.activated_on AND b.expires_on
++  );
++$$;
++
++-- Visit 口径（PRD 20）：
++--   Lifetime Visits = 本视图行数
++--   Reward Progress = 本视图 reward_eligible 为真的行数
++-- 同一会员同一天的多条已结算订单合并成一行；当天只要有一条订单被判定计入进度，
++-- 这一天就算进度的（VIP 激活当天早些时候完成的消费因此不会被误伤）。
++DROP VIEW IF EXISTS public.member_visit_days;
++CREATE VIEW public.member_visit_days
++WITH (security_invoker = true) AS
++SELECT
++  member_id,
++  (started_at AT TIME ZONE 'Europe/London')::date AS visit_date,
++  bool_or(COALESCE(reward_eligible, false))       AS reward_eligible
++FROM timer_sessions
++WHERE member_id IS NOT NULL
++  AND is_settled
++GROUP BY 1, 2;
++
++REVOKE ALL ON public.member_visit_days FROM PUBLIC;
++DO $$
++BEGIN
++  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN
++    EXECUTE 'REVOKE ALL ON public.member_visit_days FROM anon';
++  END IF;
++  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN
++    EXECUTE 'REVOKE ALL ON public.member_visit_days FROM authenticated';
++  END IF;
++  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
++    EXECUTE 'GRANT SELECT ON public.member_visit_days TO service_role';
++  END IF;
++END $$;
++
++-- ── 4. 解锁奖励（幂等）───────────────────────────────────────────────────────
++-- 按当前 Reward Progress 把所有该解锁的奖励补齐，已存在的跳过。
++-- 第 2 轮及以后靠「10 ×(轮次 - 1) + 档位」自动落在 12 / 15 / 18 / 20（PRD 7）。
++-- VIP Month 解锁即建一条未激活的权益记录，不自动激活（PRD 11.1）。
++
++CREATE OR REPLACE FUNCTION public.ensure_member_rewards(
++  p_member_id  uuid,
++  p_session_id text DEFAULT NULL
++) RETURNS jsonb
++LANGUAGE plpgsql
++SECURITY DEFINER
++SET search_path = public
++AS $$
++DECLARE
++  v_progress    integer;
++  v_cycle       integer;
++  v_node        integer;
++  v_reward_type text;
++  v_reward_id   uuid;
++  v_inserted    uuid;
++  v_coupon_id   uuid;
++  v_new         jsonb := '[]'::jsonb;
++BEGIN
++  IF NOT EXISTS (SELECT 1 FROM members WHERE member_id = p_member_id) THEN
++    RAISE EXCEPTION 'MEMBER_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++
++  SELECT count(*) INTO v_progress
++    FROM member_visit_days
++   WHERE member_id = p_member_id
++     AND reward_eligible;
++
++  IF v_progress > 0 THEN
++    FOR v_cycle IN 1 .. ((v_progress - 1) / 10 + 1) LOOP
++      FOR v_node, v_reward_type IN
++        SELECT * FROM (VALUES
++          (2,  'TWO_POUND'),
++          (5,  'FIVE_POUND'),
++          (8,  'PERSONAL_15_OFF'),
++          (8,  'FRIEND_10_OFF'),
++          (10, 'VIP_MONTH')
++        ) AS t(node, reward_type)
++      LOOP
++        CONTINUE WHEN v_progress < 10 * (v_cycle - 1) + v_node;
++
++        -- reward_id 先生成：券码由它派生，而奖励行的 CHECK 要求券类奖励必须带 coupon_id，
++        -- 所以券要在插入奖励行之前铸好。
++        v_reward_id := gen_random_uuid();
++        v_coupon_id := NULL;
++
++        IF v_reward_type IN ('TWO_POUND', 'FIVE_POUND') THEN
++          -- 内部券：券码由 reward_id 派生，天然唯一，不需要随机数与重试。
++          -- 顾客看不到这个码（PRD 9），它只是结算台核销的凭据。
++          INSERT INTO coupons (code, discount_type, discount_value, created_by)
++          VALUES (
++            'MB' || upper(substr(replace(v_reward_id::text, '-', ''), 1, 16)),
++            'fixed_amount',
++            CASE v_reward_type WHEN 'TWO_POUND' THEN 2.00 ELSE 5.00 END,
++            'member_reward'
++          )
++          RETURNING coupon_id INTO v_coupon_id;
++        END IF;
++
++        v_inserted := NULL;
++        INSERT INTO member_rewards (
++          reward_id, member_id, reward_type, cycle_index, unlocked_by_session_id, coupon_id
++        )
++        VALUES (
++          v_reward_id, p_member_id, v_reward_type, v_cycle, p_session_id, v_coupon_id
++        )
++        ON CONFLICT (member_id, reward_type, cycle_index) DO NOTHING
++        RETURNING reward_id INTO v_inserted;
++
++        -- 已存在（重复调用或并发）：幂等跳过，并撤掉刚铸的券，不留孤儿
++        IF v_inserted IS NULL THEN
++          IF v_coupon_id IS NOT NULL THEN
++            DELETE FROM coupons WHERE coupon_id = v_coupon_id;
++          END IF;
++          CONTINUE;
++        END IF;
++
++        -- VIP Month：解锁即建权益记录，activated_on 留空表示未激活
++        IF v_reward_type = 'VIP_MONTH' THEN
++          INSERT INTO member_benefits (member_id, reward_id)
++          VALUES (p_member_id, v_reward_id)
++          ON CONFLICT (reward_id) DO NOTHING;
++        END IF;
++
++        v_new := v_new || jsonb_build_object('reward_type', v_reward_type, 'cycle_index', v_cycle);
++      END LOOP;
++    END LOOP;
++  END IF;
++
++  RETURN jsonb_build_object(
++    'member_id', p_member_id,
++    'progress',  v_progress,
++    'unlocked',  v_new
++  );
++END;
++$$;
++
++-- ── 5. 结算：接入会员折扣 ────────────────────────────────────────────────────
++-- 旧的 5 参数版本必须删掉：新版本带默认值，留着两个会构成重载，
++-- 调用 5 个参数时 PostgreSQL 无法判断用哪一个。删除后原调用方式照常工作。
++DROP FUNCTION IF EXISTS public.settle_timer_session(TEXT, TEXT, TEXT, TEXT, INTEGER);
++
++CREATE OR REPLACE FUNCTION public.settle_timer_session(
++  p_session_id            TEXT,
++  p_settled_by            TEXT,
++  p_settlement_note       TEXT    DEFAULT NULL,
++  p_coupon_code           TEXT    DEFAULT NULL,
++  p_discount_amount_pence INTEGER DEFAULT NULL,
++  p_discount_source       TEXT    DEFAULT 'none',
++  p_member_id             UUID    DEFAULT NULL,
++  p_reward_type           TEXT    DEFAULT NULL
++) RETURNS JSONB
++LANGUAGE plpgsql
++SECURITY DEFINER
++SET search_path = public
++AS $$
++DECLARE
++  v_session         timer_sessions%ROWTYPE;
++  v_coupon          coupons%ROWTYPE;
++  v_reward          member_rewards%ROWTYPE;
++  v_code            TEXT;
++  v_source          TEXT;
++  v_pre_pence       INTEGER;
++  v_expect          INTEGER;
++  v_final_pence     INTEGER;
++  v_pct             NUMERIC;
++  v_vip_active      BOOLEAN := false;
++  v_reward_eligible BOOLEAN;
++  v_reward_code     TEXT;
++BEGIN
++  -- 1. 锁定订单
++  SELECT * INTO v_session FROM timer_sessions WHERE session_id = p_session_id FOR UPDATE;
++  IF NOT FOUND THEN
++    RAISE EXCEPTION 'SESSION_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_session.status <> 'completed' THEN
++    RAISE EXCEPTION 'SESSION_NOT_COMPLETED' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_session.is_settled THEN
++    RAISE EXCEPTION 'SESSION_ALREADY_SETTLED' USING ERRCODE = 'P0001';
++  END IF;
++
++  v_pre_pence := COALESCE(ROUND(v_session.amount_gbp * 100)::INTEGER, 0);
++
++  -- 2. 折扣来源归一（PRD 21：一次结算只允许一个折扣来源）
++  v_source := COALESCE(NULLIF(btrim(COALESCE(p_discount_source, '')), ''), 'none');
++  IF v_source NOT IN ('none', 'coupon', 'member_reward', 'vip_month') THEN
++    RAISE EXCEPTION 'DISCOUNT_SOURCE_INVALID' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 传了券码就是券折扣（兼容旧调用方只传券码的写法）
++  IF btrim(COALESCE(p_coupon_code, '')) <> '' AND v_source = 'none' THEN
++    v_source := 'coupon';
++  END IF;
++  IF v_source = 'coupon' AND btrim(COALESCE(p_coupon_code, '')) = '' THEN
++    RAISE EXCEPTION 'COUPON_CODE_REQUIRED' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_source <> 'coupon' AND btrim(COALESCE(p_coupon_code, '')) <> '' THEN
++    RAISE EXCEPTION 'MULTIPLE_DISCOUNT_SOURCES' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 3. VIP 生效期间强制走 VIP 折扣（PRD 11.4 / 21）。
++  --    这里故意抛错而不是静默改写：TypeScript 侧的预览必须同步改，否则预览金额与最终结算会不一致。
++  IF v_session.member_id IS NOT NULL THEN
++    v_vip_active := member_vip_active(v_session.member_id);
++  END IF;
++  IF v_vip_active AND v_source <> 'vip_month' THEN
++    RAISE EXCEPTION 'VIP_MUST_BE_APPLIED' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 4. 按来源计算并复核折扣金额
++  IF v_source = 'none' THEN
++    v_expect := 0;
++
++  ELSIF v_source = 'coupon' THEN
++    v_code := upper(btrim(p_coupon_code));
++    SELECT * INTO v_coupon FROM coupons WHERE code = v_code FOR UPDATE;
++    IF NOT FOUND THEN
++      RAISE EXCEPTION 'COUPON_NOT_FOUND' USING ERRCODE = 'P0001';
++    END IF;
++    IF v_coupon.redeemed_at IS NOT NULL THEN
++      RAISE EXCEPTION 'COUPON_ALREADY_USED' USING ERRCODE = 'P0001';
++    END IF;
++    IF v_coupon.expires_at IS NOT NULL AND v_coupon.expires_at < NOW() THEN
++      RAISE EXCEPTION 'COUPON_EXPIRED' USING ERRCODE = 'P0001';
++    END IF;
++    IF EXISTS (
++      SELECT 1 FROM coupons
++       WHERE redeemed_session_id = p_session_id AND coupon_id <> v_coupon.coupon_id
++    ) THEN
++      RAISE EXCEPTION 'SESSION_ALREADY_HAS_COUPON' USING ERRCODE = 'P0001';
++    END IF;
++
++    IF p_discount_amount_pence IS NULL THEN
++      RAISE EXCEPTION 'COUPON_DISCOUNT_MISSING' USING ERRCODE = 'P0001';
++    END IF;
++
++    IF v_coupon.discount_type = 'fixed_amount' THEN
++      v_expect := LEAST(ROUND(v_coupon.discount_value * 100)::INTEGER, v_pre_pence);
++    ELSIF v_coupon.discount_type = 'percentage_off' THEN
++      v_expect := ROUND(v_pre_pence * v_coupon.discount_value / 100)::INTEGER;
++    ELSE  -- time_minutes：首小时不可减免，优惠金额由服务端按定价常量计算
++      IF v_session.billing_minutes IS NULL OR v_session.billing_minutes <= 60 THEN
++        RAISE EXCEPTION 'COUPON_TIME_NOT_APPLICABLE' USING ERRCODE = 'P0001';
++      END IF;
++      v_expect := p_discount_amount_pence;
++    END IF;
++
++    IF p_discount_amount_pence <> v_expect THEN
++      RAISE EXCEPTION 'COUPON_DISCOUNT_MISMATCH' USING ERRCODE = 'P0001';
++    END IF;
++
++  ELSIF v_source = 'member_reward' THEN
++    IF p_member_id IS NULL THEN
++      RAISE EXCEPTION 'MEMBER_REQUIRED' USING ERRCODE = 'P0001';
++    END IF;
++    IF p_reward_type IS NULL OR p_reward_type NOT IN ('TWO_POUND', 'FIVE_POUND', 'PERSONAL_15_OFF', 'FRIEND_10_OFF') THEN
++      RAISE EXCEPTION 'REWARD_TYPE_INVALID' USING ERRCODE = 'P0001';
++    END IF;
++
++    -- 除朋友券外，订单必须属于该会员本人（PRD 10.1；忘了以会员身份计时的先用后台 Link to Member）
++    IF p_reward_type <> 'FRIEND_10_OFF'
++       AND v_session.member_id IS DISTINCT FROM p_member_id THEN
++      RAISE EXCEPTION 'MEMBER_SESSION_MISMATCH' USING ERRCODE = 'P0001';
++    END IF;
++
++    -- 挑「最早解锁且未使用」的一张同类奖励（PRD 9）。
++    -- 排除本单自己解锁出来的那张，保证刚解锁的奖励不能用于产生它的这笔消费（PRD 8）。
++    SELECT * INTO v_reward
++      FROM member_rewards
++     WHERE member_id = p_member_id
++       AND reward_type = p_reward_type
++       AND used_at IS NULL
++       AND (reward_type <> 'FRIEND_10_OFF' OR coupon_id IS NULL)   -- 已转赠成券的不能再直接使用
++       AND (unlocked_by_session_id IS NULL OR unlocked_by_session_id <> p_session_id)
++     ORDER BY unlocked_at, reward_id
++     LIMIT 1
++     FOR UPDATE;
++    IF NOT FOUND THEN
++      RAISE EXCEPTION 'MEMBER_REWARD_UNAVAILABLE' USING ERRCODE = 'P0001';
++    END IF;
++
++    IF p_discount_amount_pence IS NULL THEN
++      RAISE EXCEPTION 'MEMBER_DISCOUNT_MISSING' USING ERRCODE = 'P0001';
++    END IF;
++
++    IF p_reward_type = 'TWO_POUND' THEN
++      v_expect := LEAST(200, v_pre_pence);
++    ELSIF p_reward_type = 'FIVE_POUND' THEN
++      v_expect := LEAST(500, v_pre_pence);
++    ELSIF p_reward_type = 'PERSONAL_15_OFF' THEN
++      v_expect := ROUND(v_pre_pence * 15::numeric / 100)::INTEGER;
++    ELSE  -- FRIEND_10_OFF
++      v_expect := ROUND(v_pre_pence * 10::numeric / 100)::INTEGER;
++    END IF;
++
++    IF p_discount_amount_pence <> v_expect THEN
++      RAISE EXCEPTION 'MEMBER_DISCOUNT_MISMATCH' USING ERRCODE = 'P0001';
++    END IF;
++
++  ELSE  -- vip_month
++    IF v_session.member_id IS NULL THEN
++      RAISE EXCEPTION 'MEMBER_REQUIRED' USING ERRCODE = 'P0001';
++    END IF;
++    IF p_member_id IS NOT NULL AND p_member_id <> v_session.member_id THEN
++      RAISE EXCEPTION 'MEMBER_SESSION_MISMATCH' USING ERRCODE = 'P0001';
++    END IF;
++    IF NOT v_vip_active THEN
++      RAISE EXCEPTION 'VIP_NOT_ACTIVE' USING ERRCODE = 'P0001';
++    END IF;
++
++    IF p_discount_amount_pence IS NULL THEN
++      RAISE EXCEPTION 'MEMBER_DISCOUNT_MISSING' USING ERRCODE = 'P0001';
++    END IF;
++
++    v_expect := ROUND(v_pre_pence * 15::numeric / 100)::INTEGER;
++    IF p_discount_amount_pence <> v_expect THEN
++      RAISE EXCEPTION 'MEMBER_DISCOUNT_MISMATCH' USING ERRCODE = 'P0001';
++    END IF;
++  END IF;
++
++  v_final_pence := v_pre_pence - v_expect;
++  IF v_expect < 0 OR v_final_pence < 0 THEN
++    RAISE EXCEPTION 'DISCOUNT_AMOUNT_INVALID' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 5. 固化本次消费是否计入 Reward Progress（PRD 19.2）。
++  --    散客单不判定，留 NULL；会员单在结算这一刻看有没有生效中的 VIP。
++  IF v_session.member_id IS NULL THEN
++    v_reward_eligible := NULL;
++  ELSE
++    v_reward_eligible := NOT v_vip_active;
++  END IF;
++
++  -- 会员券类奖励的内部券码，仅作快照留痕，顾客端不展示
++  IF v_source = 'member_reward' AND v_reward.coupon_id IS NOT NULL THEN
++    SELECT code INTO v_reward_code FROM coupons WHERE coupon_id = v_reward.coupon_id;
++  END IF;
++
++  -- 6. 写结算（折扣快照列沿用 013 的字段：会员券落在 coupon_id，VIP 折扣不带券）
++  UPDATE timer_sessions SET
++    is_settled                 = TRUE,
++    actual_amount_gbp          = ROUND(v_final_pence / 100.0, 2),
++    settlement_note            = p_settlement_note,
++    settled_at                 = NOW(),
++    settled_by                 = p_settled_by,
++    reward_eligible            = v_reward_eligible,
++    coupon_id                  = CASE WHEN v_source = 'coupon'        THEN v_coupon.coupon_id
++                                     WHEN v_source = 'member_reward' THEN v_reward.coupon_id
++                                     ELSE NULL END,
++    coupon_code_snapshot       = CASE WHEN v_source = 'coupon'        THEN v_coupon.code
++                                     WHEN v_source = 'member_reward' THEN v_reward_code
++                                     ELSE NULL END,
++    discount_type_snapshot     = CASE v_source
++                                   WHEN 'coupon'        THEN v_coupon.discount_type
++                                   WHEN 'member_reward' THEN CASE v_reward.reward_type
++                                                              WHEN 'TWO_POUND'       THEN 'fixed_amount'
++                                                              WHEN 'FIVE_POUND'      THEN 'fixed_amount'
++                                                              ELSE 'percentage_off'
++                                                            END
++                                   WHEN 'vip_month'     THEN 'percentage_off'
++                                   ELSE NULL
++                                 END,
++    discount_value_snapshot    = CASE v_source
++                                   WHEN 'coupon'        THEN v_coupon.discount_value
++                                   WHEN 'member_reward' THEN CASE v_reward.reward_type
++                                                              WHEN 'TWO_POUND'       THEN 2.00
++                                                              WHEN 'FIVE_POUND'      THEN 5.00
++                                                              WHEN 'PERSONAL_15_OFF' THEN 15.00
++                                                              ELSE 10.00
++                                                            END
++                                   WHEN 'vip_month'     THEN 15.00
++                                   ELSE NULL
++                                 END,
++    discount_amount_gbp        = ROUND(v_expect / 100.0, 2),
++    pre_discount_amount_gbp    = v_session.amount_gbp,
++    discounted_billing_minutes = NULL
++  WHERE session_id = p_session_id
++  RETURNING * INTO v_session;
++
++  -- 7. 核销：普通券，或会员奖励（券类奖励同时核销它自己的内部券）
++  IF v_source = 'coupon' THEN
++    UPDATE coupons SET
++      redeemed_at         = NOW(),
++      redeemed_by         = p_settled_by,
++      redeemed_session_id = p_session_id
++    WHERE coupon_id = v_coupon.coupon_id;
++
++  ELSIF v_source = 'member_reward' THEN
++    UPDATE member_rewards SET
++      used_at         = NOW(),
++      used_by         = p_settled_by,
++      used_session_id = p_session_id
++    WHERE reward_id = v_reward.reward_id;
++
++    IF v_reward.coupon_id IS NOT NULL THEN
++      UPDATE coupons SET
++        redeemed_at         = NOW(),
++        redeemed_by         = p_settled_by,
++        redeemed_session_id = p_session_id
++      WHERE coupon_id = v_reward.coupon_id
++        AND redeemed_at IS NULL;
++      IF NOT FOUND THEN
++        RAISE EXCEPTION 'MEMBER_REWARD_COUPON_USED' USING ERRCODE = 'P0001';
++      END IF;
++    END IF;
++  END IF;
++
++  -- 8. 结算落库之后才解锁新奖励：本单用不到刚解锁出来的奖励（PRD 8）
++  IF v_session.member_id IS NOT NULL THEN
++    PERFORM ensure_member_rewards(v_session.member_id, p_session_id);
++  END IF;
++
++  RETURN to_jsonb(v_session);
++END;
++$$;
++
++-- ── 6. 撤销结算：会员奖励与 VIP 的回退 ───────────────────────────────────────
++-- 全部检查放在动手之前，避免半途报错留下半截状态（PRD 18）。
++
++CREATE OR REPLACE FUNCTION public.unsettle_timer_session(
++  p_session_id TEXT
++) RETURNS JSONB
++LANGUAGE plpgsql
++SECURITY DEFINER
++SET search_path = public
++AS $$
++DECLARE
++  v_session     timer_sessions%ROWTYPE;
++  v_coupon      coupons%ROWTYPE;
++  v_blocked     INTEGER;
++  v_coupon_ids  uuid[];
++  v_vip_started INTEGER;
++BEGIN
++  SELECT * INTO v_session FROM timer_sessions WHERE session_id = p_session_id FOR UPDATE;
++  IF NOT FOUND THEN
++    RAISE EXCEPTION 'SESSION_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++  IF NOT v_session.is_settled THEN
++    RAISE EXCEPTION 'SESSION_NOT_SETTLED' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 6.1 本单解锁出来的奖励，只要有一张已经被用掉（或被转赠成券），普通店员撤不了
++  SELECT count(*) INTO v_blocked
++    FROM member_rewards
++   WHERE unlocked_by_session_id = p_session_id
++     AND (
++       used_at IS NOT NULL
++       OR (reward_type = 'FRIEND_10_OFF' AND coupon_id IS NOT NULL)
++       OR EXISTS (
++         SELECT 1 FROM coupons c
++          WHERE c.coupon_id = member_rewards.coupon_id
++            AND c.redeemed_at IS NOT NULL
++       )
++     );
++  IF v_blocked > 0 THEN
++    RAISE EXCEPTION 'REWARD_ALREADY_USED' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 6.2 本单解锁的 VIP Month 已经激活过，撤不掉（权益已经消耗在时间上）
++  SELECT count(*) INTO v_vip_started
++    FROM member_benefits b
++    JOIN member_rewards r ON r.reward_id = b.reward_id
++   WHERE r.unlocked_by_session_id = p_session_id
++     AND b.activated_on IS NOT NULL;
++  IF v_vip_started > 0 THEN
++    RAISE EXCEPTION 'VIP_ALREADY_ACTIVATED' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 6.3 恢复该单核销掉的普通券（仅当该券确实由本单核销）
++  IF v_session.coupon_id IS NOT NULL THEN
++    SELECT * INTO v_coupon FROM coupons WHERE coupon_id = v_session.coupon_id FOR UPDATE;
++    IF FOUND THEN
++      IF v_coupon.redeemed_session_id IS DISTINCT FROM p_session_id OR v_coupon.redeemed_at IS NULL THEN
++        RAISE EXCEPTION 'COUPON_REDEMPTION_MISMATCH' USING ERRCODE = 'P0001';
++      END IF;
++      UPDATE coupons SET
++        redeemed_at         = NULL,
++        redeemed_by         = NULL,
++        redeemed_session_id = NULL
++      WHERE coupon_id = v_coupon.coupon_id;
++    END IF;
++  END IF;
++
++  -- 6.4 本单消费掉的会员奖励退回未使用（PRD 24 验收项）
++  UPDATE member_rewards SET
++    used_at         = NULL,
++    used_by         = NULL,
++    used_session_id = NULL
++  WHERE used_session_id = p_session_id;
++
++  -- 6.5 回退本单解锁出来的奖励。
++  --      顺序不能反：member_rewards.coupon_id 指向 coupons 且是 ON DELETE RESTRICT，
++  --      必须先删奖励行，再删它名下的内部券，否则外键会把整次撤销拦下。
++  SELECT COALESCE(array_agg(coupon_id), '{}'::uuid[]) INTO v_coupon_ids
++    FROM member_rewards
++   WHERE unlocked_by_session_id = p_session_id
++     AND coupon_id IS NOT NULL
++     AND used_at IS NULL;
++
++  DELETE FROM member_benefits
++   WHERE reward_id IN (
++     SELECT reward_id FROM member_rewards WHERE unlocked_by_session_id = p_session_id
++   );
++
++  DELETE FROM member_rewards
++   WHERE unlocked_by_session_id = p_session_id
++     AND used_at IS NULL;
++
++  DELETE FROM coupons
++   WHERE coupon_id = ANY(v_coupon_ids)
++     AND redeemed_at IS NULL
++     AND NOT EXISTS (
++       SELECT 1 FROM timer_sessions t WHERE t.coupon_id = coupons.coupon_id
++     );
++
++  -- 6.6 清空结算字段与进度资格
++  UPDATE timer_sessions SET
++    is_settled                 = FALSE,
++    actual_amount_gbp          = NULL,
++    actual_amount_cny          = NULL,
++    settlement_note            = NULL,
++    settled_at                 = NULL,
++    settled_by                 = NULL,
++    reward_eligible            = NULL,
++    coupon_id                  = NULL,
++    coupon_code_snapshot       = NULL,
++    discount_type_snapshot     = NULL,
++    discount_value_snapshot    = NULL,
++    discount_amount_gbp        = 0,
++    pre_discount_amount_gbp    = NULL,
++    discounted_billing_minutes = NULL
++  WHERE session_id = p_session_id
++  RETURNING * INTO v_session;
++
++  RETURN to_jsonb(v_session);
++END;
++$$;
++
++-- ── 7. 后台动作：把订单关联到会员、激活 VIP Month ────────────────────────────
++
++-- 顾客以散客身份开始计时后才想起自己是会员时，店员在后台把订单挂到会员名下（PRD 5.2）。
++-- 只允许挂「尚未结算」的单：进度必须来自真实结算记录，已结算的单要先撤销结算再挂，
++-- 否则等于绕过结算台账手动改数字（PRD 16.3、18）。
++CREATE OR REPLACE FUNCTION public.link_timer_session_to_member(
++  p_session_id text,
++  p_member_id  uuid
++) RETURNS jsonb
++LANGUAGE plpgsql
++SECURITY DEFINER
++SET search_path = public
++AS $$
++DECLARE
++  v_session timer_sessions%ROWTYPE;
++BEGIN
++  IF NOT EXISTS (SELECT 1 FROM members WHERE member_id = p_member_id AND is_active) THEN
++    RAISE EXCEPTION 'MEMBER_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++
++  SELECT * INTO v_session FROM timer_sessions WHERE session_id = p_session_id FOR UPDATE;
++  IF NOT FOUND THEN
++    RAISE EXCEPTION 'SESSION_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_session.is_settled THEN
++    RAISE EXCEPTION 'SESSION_ALREADY_SETTLED' USING ERRCODE = 'P0001';
++  END IF;
++
++  UPDATE timer_sessions SET
++    member_id       = p_member_id,
++    reward_eligible = NULL          -- 结算时才判定，避免留下未经验证的进度资格
++  WHERE session_id = p_session_id
++  RETURNING * INTO v_session;
++
++  RETURN to_jsonb(v_session);
++END;
++$$;
++
++-- 激活一张 VIP Month（会员自己点或店员代点，PRD 11.1）。
++-- 同一时间最多一张生效，且到期后不自动续（PRD 11.6）：靠锁住该会员全部权益行来串行化。
++CREATE OR REPLACE FUNCTION public.activate_member_vip(
++  p_reward_id    uuid,
++  p_activated_by text
++) RETURNS jsonb
++LANGUAGE plpgsql
++SECURITY DEFINER
++SET search_path = public
++AS $$
++DECLARE
++  v_reward  member_rewards%ROWTYPE;
++  v_benefit member_benefits%ROWTYPE;
++  v_today   date;
++BEGIN
++  v_today := (NOW() AT TIME ZONE 'Europe/London')::date;
++
++  SELECT * INTO v_reward FROM member_rewards WHERE reward_id = p_reward_id FOR UPDATE;
++  IF NOT FOUND THEN
++    RAISE EXCEPTION 'MEMBER_REWARD_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_reward.reward_type <> 'VIP_MONTH' THEN
++    RAISE EXCEPTION 'REWARD_TYPE_INVALID' USING ERRCODE = 'P0001';
++  END IF;
++
++  SELECT * INTO v_benefit FROM member_benefits WHERE reward_id = p_reward_id FOR UPDATE;
++  IF NOT FOUND THEN
++    RAISE EXCEPTION 'MEMBER_BENEFIT_NOT_FOUND' USING ERRCODE = 'P0001';
++  END IF;
++  IF v_benefit.activated_on IS NOT NULL THEN
++    RAISE EXCEPTION 'VIP_ALREADY_ACTIVATED' USING ERRCODE = 'P0001';
++  END IF;
++
++  -- 先锁住该会员的全部权益行，再把「有没有生效中的」判断与写入放进同一个事务
++  PERFORM 1 FROM member_benefits WHERE member_id = v_reward.member_id FOR UPDATE;
++  IF EXISTS (
++    SELECT 1 FROM member_benefits b
++     WHERE b.member_id = v_reward.member_id
++       AND b.activated_on IS NOT NULL
++       AND v_today BETWEEN b.activated_on AND b.expires_on
++  ) THEN
++    RAISE EXCEPTION 'VIP_ALREADY_ACTIVE' USING ERRCODE = 'P0001';
++  END IF;
++
++  UPDATE member_benefits SET
++    activated_on = v_today,
++    activated_at = NOW(),
++    expires_on   = v_today + 29,      -- 30 天含首尾（PRD 11.2）
++    activated_by = p_activated_by
++  WHERE benefit_id = v_benefit.benefit_id
++  RETURNING * INTO v_benefit;
++
++  RETURN to_jsonb(v_benefit);
++END;
++$$;
++
++-- ── 8. 权限：仅 service role 可执行 ──────────────────────────────────────────
++
++DO $$
++BEGIN
++  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'service_role') THEN
++    EXECUTE 'REVOKE ALL ON FUNCTION public.settle_timer_session(TEXT, TEXT, TEXT, TEXT, INTEGER, TEXT, UUID, TEXT) FROM PUBLIC';
++    EXECUTE 'GRANT EXECUTE ON FUNCTION public.settle_timer_session(TEXT, TEXT, TEXT, TEXT, INTEGER, TEXT, UUID, TEXT) TO service_role';
++    EXECUTE 'REVOKE ALL ON FUNCTION public.unsettle_timer_session(TEXT) FROM PUBLIC';
++    EXECUTE 'GRANT EXECUTE ON FUNCTION public.unsettle_timer_session(TEXT) TO service_role';
++    EXECUTE 'REVOKE ALL ON FUNCTION public.ensure_member_rewards(UUID, TEXT) FROM PUBLIC';
++    EXECUTE 'GRANT EXECUTE ON FUNCTION public.ensure_member_rewards(UUID, TEXT) TO service_role';
++    EXECUTE 'REVOKE ALL ON FUNCTION public.member_vip_active(UUID, TIMESTAMPTZ) FROM PUBLIC';
++    EXECUTE 'GRANT EXECUTE ON FUNCTION public.member_vip_active(UUID, TIMESTAMPTZ) TO service_role';
++    EXECUTE 'REVOKE ALL ON FUNCTION public.link_timer_session_to_member(TEXT, UUID) FROM PUBLIC';
++    EXECUTE 'GRANT EXECUTE ON FUNCTION public.link_timer_session_to_member(TEXT, UUID) TO service_role';
++    EXECUTE 'REVOKE ALL ON FUNCTION public.activate_member_vip(UUID, TEXT) FROM PUBLIC';
++    EXECUTE 'GRANT EXECUTE ON FUNCTION public.activate_member_vip(UUID, TEXT) TO service_role';
++  END IF;
++END $$;
++
++-- ============================================================
++-- ROLLBACK：
++--   先恢复 013 版本的 settle_timer_session（无会员参数），再执行下面这些。
++--   DROP FUNCTION IF EXISTS public.settle_timer_session(TEXT, TEXT, TEXT, TEXT, INTEGER, TEXT, UUID, TEXT);
++--   DROP FUNCTION IF EXISTS public.ensure_member_rewards(UUID, TEXT);
++--   DROP FUNCTION IF EXISTS public.link_timer_session_to_member(TEXT, UUID);
++--   DROP FUNCTION IF EXISTS public.activate_member_vip(UUID, TEXT);
++--   DROP FUNCTION IF EXISTS public.member_vip_active(UUID, TIMESTAMPTZ);
++--   DROP VIEW  IF EXISTS public.member_visit_days;
++--   DROP TABLE IF EXISTS member_benefits;
++--   DROP TABLE IF EXISTS member_rewards;
++--   ALTER TABLE timer_sessions DROP COLUMN IF EXISTS reward_eligible;   -- 见 016
++--   注意：回滚不会恢复已被 017 删除的历史奖励记录。
++-- ============================================================
+diff --git a/tests/member.test.ts b/tests/member.test.ts
+new file mode 100644
+index 0000000..1820544
+--- /dev/null
++++ b/tests/member.test.ts
+@@ -0,0 +1,396 @@
++import assert from 'node:assert/strict'
++import test from 'node:test'
++import { calcBill } from '../lib/timer/pricing.ts'
++import {
++  CYCLE_REWARD_NODES,
++  FIVE_POUND_PENCE,
++  PERSONAL_DISCOUNT_PERCENT,
++  REWARD_CYCLE_SIZE,
++  TWO_POUND_PENCE,
++  VIP_MONTH_DAYS,
++  buildVisitDays,
++  canActivateVip,
++  computeMemberDiscount,
++  countLifetimeVisits,
++  countRewardProgress,
++  cycleProgress,
++  isVipActive,
++  isVipBenefitActiveOn,
++  isValidMemberEmail,
++  londonDateOf,
++  maskEmail,
++  nextReward,
++  normalizeMemberEmail,
++  percentOffPence,
++  pickRewardForUse,
++  progressBarCells,
++  rewardAvailabilityList,
++  rewardState,
++  rewardThreshold,
++  unlockedRewardsForProgress,
++  usableRewardTypes,
++  vipExpiresOn,
++  vipMonthSummary,
++  type MemberRewardRow,
++  type RewardType,
++  type VisitSessionRow,
++  type VipBenefitRow,
++} from '../lib/member/member.ts'
++
++// ── 测试辅助 ────────────────────────────────────────────────────────────────
++
++function session(startedAt: string, opts: Partial<VisitSessionRow> = {}): VisitSessionRow {
++  return {
++    session_id:      `T-${startedAt}`,
++    member_id:       'member-1',
++    started_at:      startedAt,
++    is_settled:      true,
++    reward_eligible: true,
++    ...opts,
++  }
++}
++
++let rewardSeq = 0
++function reward(type: RewardType, opts: Partial<MemberRewardRow> = {}): MemberRewardRow {
++  rewardSeq += 1
++  return {
++    reward_id:   `reward-${String(rewardSeq).padStart(3, '0')}`,
++    member_id:   'member-1',
++    reward_type: type,
++    cycle_index: 1,
++    unlocked_at: '2026-09-01T10:00:00Z',
++    coupon_id:   type === 'TWO_POUND' || type === 'FIVE_POUND' ? `coupon-${rewardSeq}` : null,
++    used_at:     null,
++    ...opts,
++  }
++}
++
++// ── 身份 ────────────────────────────────────────────────────────────────────
++
++test('email_key 规范化：去首尾空格 + 转小写', () => {
++  assert.equal(normalizeMemberEmail('  Wei@Example.COM '), 'wei@example.com')
++  assert.equal(normalizeMemberEmail(null), '')
++  assert.equal(normalizeMemberEmail(123), '')
++})
++
++test('重复邮箱的大小写与空格差异被识别成同一个人', () => {
++  assert.equal(normalizeMemberEmail('Wei@Gmail.com'), normalizeMemberEmail('wei@gmail.com '))
++})
++
++test('邮箱形状校验与数据库 CHECK 同口径', () => {
++  assert.equal(isValidMemberEmail('wei@gmail.com'), true)
++  assert.equal(isValidMemberEmail('wei@sub.domain.co.uk'), true)
++  assert.equal(isValidMemberEmail('wei@gmail'), false)
++  assert.equal(isValidMemberEmail('@gmail.com'), false)
++  assert.equal(isValidMemberEmail('wei.com'), false)
++  assert.equal(isValidMemberEmail('wei@gmail.'), false)
++  assert.equal(isValidMemberEmail('wei @gmail.com'), false)
++})
++
++test('脱敏邮箱只露出首字母与域名', () => {
++  assert.equal(maskEmail('zhangwei@gmail.com'), 'z***@gmail.com')
++  assert.equal(maskEmail('not-an-email'), '***')
++})
++
++// ── 伦敦自然日 ──────────────────────────────────────────────────────────────
++
++test('Visit 归日用伦敦当地日期，跨午夜算到店那天', () => {
++  // 伦敦夏令时 BST = UTC+1
++  assert.equal(londonDateOf('2026-09-15T23:30:00Z'), '2026-09-16')
++  assert.equal(londonDateOf('2026-09-16T00:30:00Z'), '2026-09-16')
++  // 冬季 GMT = UTC
++  assert.equal(londonDateOf('2026-01-15T23:30:00Z'), '2026-01-15')
++  assert.equal(londonDateOf('2026-01-15T00:30:00Z'), '2026-01-15')
++})
++
++test('同一天的多条已结算单只算一个访日', () => {
++  const visits = buildVisitDays([
++    session('2026-09-15T09:00:00Z'),
++    session('2026-09-15T15:00:00Z', { session_id: 'T-2' }),
++    session('2026-09-16T09:00:00Z', { session_id: 'T-3' }),
++  ])
++  assert.deepEqual(visits.map(v => v.visit_date), ['2026-09-15', '2026-09-16'])
++  assert.equal(countLifetimeVisits(visits), 2)
++  assert.equal(countRewardProgress(visits), 2)
++})
++
++test('散客单与未结算单都不计入', () => {
++  const visits = buildVisitDays([
++    session('2026-09-15T09:00:00Z', { member_id: null }),
++    session('2026-09-16T09:00:00Z', { is_settled: false }),
++    session('2026-09-17T09:00:00Z', { reward_eligible: null }),
++  ])
++  assert.deepEqual(visits.map(v => v.visit_date), ['2026-09-17'])
++  assert.equal(countLifetimeVisits(visits), 1)
++  assert.equal(countRewardProgress(visits), 0)
++})
++
++test('VIP 期间 Lifetime 加、Reward Progress 不加，两个数因此会不同', () => {
++  const visits = buildVisitDays([
++    session('2026-09-10T12:00:00Z', { reward_eligible: true }),
++    session('2026-09-11T12:00:00Z', { reward_eligible: false }),
++    session('2026-09-12T12:00:00Z', { reward_eligible: false }),
++  ])
++  assert.equal(countLifetimeVisits(visits), 3)
++  assert.equal(countRewardProgress(visits), 1)
++})
++
++test('VIP 激活当天：激活前完成的那条进度不回退', () => {
++  // 同一天两条单，一条在激活前（eligible），一条在激活后（不 eligible）
++  const visits = buildVisitDays([
++    session('2026-09-18T09:00:00Z', { reward_eligible: true }),
++    session('2026-09-18T18:00:00Z', { reward_eligible: false, session_id: 'T-2' }),
++  ])
++  assert.equal(countLifetimeVisits(visits), 1)
++  assert.equal(countRewardProgress(visits), 1)
++})
++
++// ── 轮次与进度 ──────────────────────────────────────────────────────────────
++
++test('档位门槛：第 2 轮落在 12 / 15 / 18 / 20', () => {
++  assert.equal(rewardThreshold(1, 2), 2)
++  assert.equal(rewardThreshold(1, 10), 10)
++  assert.equal(rewardThreshold(2, 2), 12)
++  assert.equal(rewardThreshold(2, 5), 15)
++  assert.equal(rewardThreshold(2, 8), 18)
++  assert.equal(rewardThreshold(2, 10), 20)
++  assert.equal(rewardThreshold(3, 2), 22)
++})
++
++test('解锁集合随进度增长，第 8 档一次发两张', () => {
++  assert.deepEqual(unlockedRewardsForProgress(0), [])
++  assert.deepEqual(
++    unlockedRewardsForProgress(2).map(r => [r.cycle_index, r.reward_type]),
++    [[1, 'TWO_POUND']],
++  )
++  assert.deepEqual(
++    unlockedRewardsForProgress(7).map(r => r.reward_type),
++    ['TWO_POUND', 'FIVE_POUND'],
++  )
++  assert.deepEqual(
++    unlockedRewardsForProgress(8).map(r => r.reward_type),
++    ['TWO_POUND', 'FIVE_POUND', 'PERSONAL_15_OFF', 'FRIEND_10_OFF'],
++  )
++  assert.deepEqual(
++    unlockedRewardsForProgress(10).map(r => r.reward_type),
++    ['TWO_POUND', 'FIVE_POUND', 'PERSONAL_15_OFF', 'FRIEND_10_OFF', 'VIP_MONTH'],
++  )
++})
++
++test('第 2 轮的四个节点按 12 / 15 / 18 / 20 解锁', () => {
++  const at12 = unlockedRewardsForProgress(12)
++  assert.deepEqual(at12.slice(-1).map(r => [r.cycle_index, r.reward_type]), [[2, 'TWO_POUND']])
++  const at20 = unlockedRewardsForProgress(20)
++  assert.deepEqual(
++    at20.filter(r => r.cycle_index === 2).map(r => [r.threshold, r.reward_type]),
++    [[12, 'TWO_POUND'], [15, 'FIVE_POUND'], [18, 'PERSONAL_15_OFF'], [18, 'FRIEND_10_OFF'], [20, 'VIP_MONTH']],
++  )
++  assert.equal(at20.length, 10)
++})
++
++test('解锁数量单调不减，且同一档位只出现一次', () => {
++  let previous = 0
++  for (let progress = 0; progress <= 40; progress++) {
++    const unlocked = unlockedRewardsForProgress(progress)
++    assert.ok(unlocked.length >= previous, `progress ${progress} 解锁数倒退了`)
++    previous = unlocked.length
++    const keys = unlocked.map(r => `${r.cycle_index}:${r.reward_type}`)
++    assert.equal(new Set(keys).size, keys.length, `progress ${progress} 出现重复档位`)
++  }
++})
++
++test('下一个奖励与还差几次（PRD 7.1 的例子：6 / 10，还差 2 次）', () => {
++  assert.deepEqual(nextReward(6), { cycle_index: 1, node: 8, threshold: 8, remaining: 2, rewardTypes: ['PERSONAL_15_OFF', 'FRIEND_10_OFF'] })
++  assert.deepEqual(nextReward(0), { cycle_index: 1, node: 2, threshold: 2, remaining: 2, rewardTypes: ['TWO_POUND'] })
++  assert.deepEqual(nextReward(10), { cycle_index: 2, node: 2, threshold: 12, remaining: 2, rewardTypes: ['TWO_POUND'] })
++  assert.deepEqual(nextReward(21), { cycle_index: 3, node: 2, threshold: 22, remaining: 1, rewardTypes: ['TWO_POUND'] })
++})
++
++test('十格循环显示：内部总进度不清零', () => {
++  assert.equal(cycleProgress(0), 0)
++  assert.equal(cycleProgress(6), 6)
++  assert.equal(cycleProgress(10), 10)
++  assert.equal(cycleProgress(11), 1)
++  assert.equal(cycleProgress(20), 10)
++  assert.equal(cycleProgress(23), 3)
++})
++
++test('进度条格子：2 / 5 / 8 / 10 是奖励节点', () => {
++  const cells = progressBarCells(6)
++  assert.equal(cells.length, REWARD_CYCLE_SIZE)
++  assert.deepEqual(cells.filter(c => c.isRewardNode).map(c => c.index), [2, 5, 8, 10])
++  assert.deepEqual(cells.filter(c => c.state === 'done').map(c => c.index), [1, 2, 3, 4, 5, 6])
++  assert.equal(cells[6].state, 'current')
++  const roundTwo = progressBarCells(13)
++  assert.equal(roundTwo[0].threshold, 11)
++  assert.deepEqual(roundTwo.filter(c => c.state === 'done').map(c => c.index), [1, 2, 3])
++})
++
++test('奖励节点表就是 PRD 第 7 节那张表', () => {
++  assert.deepEqual(
++    CYCLE_REWARD_NODES.map(n => [n.node, n.rewardTypes]),
++    [[2, ['TWO_POUND']], [5, ['FIVE_POUND']], [8, ['PERSONAL_15_OFF', 'FRIEND_10_OFF']], [10, ['VIP_MONTH']]],
++  )
++})
++
++// ── 奖励可用性 ──────────────────────────────────────────────────────────────
++
++test('奖励状态：已用 > 已转赠 > VIP 期间暂停 > 可用', () => {
++  assert.equal(rewardState(reward('TWO_POUND', { used_at: '2026-09-20T10:00:00Z' }), false), 'used')
++  assert.equal(rewardState(reward('FRIEND_10_OFF', { coupon_id: 'coupon-x' }), false), 'transferred')
++  assert.equal(rewardState(reward('PERSONAL_15_OFF'), true), 'paused_by_vip')
++  assert.equal(rewardState(reward('PERSONAL_15_OFF'), false), 'available')
++})
++
++test('VIP 期间其他奖励继续显示，只是标成不可用', () => {
++  const list = rewardAvailabilityList([reward('TWO_POUND'), reward('PERSONAL_15_OFF')], true)
++  assert.equal(list.length, 2)
++  assert.deepEqual(list.map(r => r.state), ['paused_by_vip', 'paused_by_vip'])
++})
++
++test('同类多张时挑最早解锁的那张，与 SQL 的排序一致', () => {
++  const older = reward('TWO_POUND', { reward_id: 'reward-a', unlocked_at: '2026-09-01T10:00:00Z' })
++  const newer = reward('TWO_POUND', { reward_id: 'reward-b', unlocked_at: '2026-09-05T10:00:00Z' })
++  assert.equal(pickRewardForUse([newer, older], 'TWO_POUND', false)?.reward_id, 'reward-a')
++})
++
++test('挑券时跳过已用、已转赠与 VIP 暂停的', () => {
++  const used = reward('TWO_POUND', { reward_id: 'reward-a', used_at: '2026-09-20T10:00:00Z' })
++  const ok = reward('TWO_POUND', { reward_id: 'reward-b' })
++  assert.equal(pickRewardForUse([used, ok], 'TWO_POUND', false)?.reward_id, 'reward-b')
++  assert.equal(pickRewardForUse([ok], 'TWO_POUND', true), null)
++
++  const transferred = reward('FRIEND_10_OFF', { reward_id: 'reward-c', coupon_id: 'coupon-x' })
++  assert.equal(pickRewardForUse([transferred], 'FRIEND_10_OFF', false), null)
++})
++
++test('结算台可选奖励去重后按类型给出', () => {
++  const rewards = [
++    reward('TWO_POUND', { reward_id: 'reward-a' }),
++    reward('TWO_POUND', { reward_id: 'reward-b', cycle_index: 2 }),
++    reward('PERSONAL_15_OFF', { reward_id: 'reward-c' }),
++    reward('VIP_MONTH', { reward_id: 'reward-d' }),
++  ]
++  assert.deepEqual(usableRewardTypes(rewards, false), ['TWO_POUND', 'PERSONAL_15_OFF'])
++  assert.deepEqual(usableRewardTypes(rewards, true), [])
++})
++
++// ── VIP Month ───────────────────────────────────────────────────────────────
++
++test('VIP 有效期 30 天含首尾：9 月 18 日激活，10 月 17 日整天仍有效', () => {
++  assert.equal(VIP_MONTH_DAYS, 30)
++  assert.equal(vipExpiresOn('2026-09-18'), '2026-10-17')
++  const benefit: VipBenefitRow = {
++    benefit_id: 'benefit-1', reward_id: 'reward-1',
++    activated_on: '2026-09-18', expires_on: '2026-10-17',
++  }
++  assert.equal(isVipBenefitActiveOn(benefit, '2026-09-17'), false)
++  assert.equal(isVipBenefitActiveOn(benefit, '2026-09-18'), true)
++  assert.equal(isVipBenefitActiveOn(benefit, '2026-10-17'), true)
++  assert.equal(isVipBenefitActiveOn(benefit, '2026-10-18'), false)
++})
++
++test('跨月与跨年的有效期推算', () => {
++  assert.equal(vipExpiresOn('2026-10-17'), '2026-11-15')
++  assert.equal(vipExpiresOn('2026-12-20'), '2027-01-18')
++  assert.equal(vipExpiresOn('2028-02-01'), '2028-03-01')
++})
++
++test('未激活的 VIP Month 不生效', () => {
++  const notActivated: VipBenefitRow = {
++    benefit_id: 'benefit-2', reward_id: 'reward-2', activated_on: null, expires_on: null,
++  }
++  assert.equal(isVipBenefitActiveOn(notActivated, '2026-09-18'), false)
++  assert.equal(isVipActive([notActivated], '2026-09-18'), false)
++})
++
++test('可以累计多张未激活的 VIP Month，同一时间只有一张生效', () => {
++  const rewards = [
++    reward('VIP_MONTH', { reward_id: 'reward-v1', cycle_index: 1 }),
++    reward('VIP_MONTH', { reward_id: 'reward-v2', cycle_index: 2 }),
++  ]
++  const benefits: VipBenefitRow[] = [
++    { benefit_id: 'b1', reward_id: 'reward-v1', activated_on: '2026-09-18', expires_on: '2026-10-17' },
++    { benefit_id: 'b2', reward_id: 'reward-v2', activated_on: null, expires_on: null },
++  ]
++  const summary = vipMonthSummary(rewards, benefits, '2026-09-20')
++  assert.equal(summary.active?.benefit_id, 'b1')
++  assert.equal(summary.readyToActivate, 1)
++  assert.equal(summary.activated, 1)
++  assert.deepEqual(canActivateVip(benefits, '2026-09-20'), { ok: false, error: 'VIP_ALREADY_ACTIVE' })
++
++  // 到期之后不会自动续上，需要再手动激活
++  assert.deepEqual(canActivateVip(benefits, '2026-10-18'), { ok: true })
++  assert.equal(vipMonthSummary(rewards, benefits, '2026-10-18').active, null)
++})
++
++// ── 折扣计算 ────────────────────────────────────────────────────────────────
++
++test('£2 / £5 Voucher 抵扣金额与封顶', () => {
++  const two = computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: false, rewardType: 'TWO_POUND' })
++  assert.equal(two.ok && two.preview.discountAmountPence, TWO_POUND_PENCE)
++  assert.equal(two.ok && two.preview.finalGbp, 11.99)
++
++  const five = computeMemberDiscount('member_reward', { amountGbp: 3.5, vipActive: false, rewardType: 'FIVE_POUND' })
++  assert.equal(five.ok && five.preview.discountAmountPence, 350)
++  assert.equal(five.ok && five.preview.finalGbp, 0)
++  assert.ok(five.ok && five.preview.discountAmountPence <= FIVE_POUND_PENCE)
++})
++
++test('本人 15% 与朋友 10% 按分四舍五入', () => {
++  const personal = computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: false, rewardType: 'PERSONAL_15_OFF' })
++  assert.equal(personal.ok && personal.preview.discountAmountPence, 210)
++  assert.equal(personal.ok && personal.preview.discountValue, PERSONAL_DISCOUNT_PERCENT)
++
++  const friend = computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: false, rewardType: 'FRIEND_10_OFF' })
++  assert.equal(friend.ok && friend.preview.discountAmountPence, 140)
++
++  assert.equal(percentOffPence(1399, 15), 210)
++  assert.equal(percentOffPence(1399, 10), 140)
++  assert.equal(percentOffPence(100, 15), 15)
++})
++
++test('折扣金额跟着仓库真实定价走', () => {
++  const bill = calcBill(150)
++  const vip = computeMemberDiscount('vip_month', { amountGbp: bill.totalGbp, vipActive: true })
++  assert.equal(vip.ok, true)
++  if (!vip.ok) return
++  assert.equal(vip.preview.discountAmountPence, Math.round(bill.totalGbp * 100 * 15 / 100))
++  assert.equal(vip.preview.preDiscountGbp, bill.totalGbp)
++})
++
++test('不打折时金额原样返回', () => {
++  const none = computeMemberDiscount('none', { amountGbp: 25.99, vipActive: false })
++  assert.equal(none.ok && none.preview.discountAmountPence, 0)
++  assert.equal(none.ok && none.preview.finalGbp, 25.99)
++})
++
++test('VIP 生效期间强制走 VIP，其他会员奖励一律拒绝', () => {
++  const blocked = computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: true, rewardType: 'TWO_POUND' })
++  assert.deepEqual(blocked, { ok: false, error: 'VIP_MUST_BE_APPLIED' })
++  const notVip = computeMemberDiscount('vip_month', { amountGbp: 13.99, vipActive: false })
++  assert.deepEqual(notVip, { ok: false, error: 'VIP_NOT_ACTIVE' })
++})
++
++test('会员奖励的入参校验', () => {
++  assert.deepEqual(
++    computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: false }),
++    { ok: false, error: 'REWARD_TYPE_INVALID' },
++  )
++  assert.deepEqual(
++    computeMemberDiscount('member_reward', { amountGbp: 13.99, vipActive: false, rewardType: 'VIP_MONTH' }),
++    { ok: false, error: 'REWARD_TYPE_INVALID' },
++  )
++  assert.deepEqual(
++    computeMemberDiscount('none', { amountGbp: null, vipActive: false }),
++    { ok: false, error: 'SESSION_AMOUNT_MISSING' },
++  )
++  assert.deepEqual(
++    computeMemberDiscount('coupon', { amountGbp: 13.99, vipActive: false }),
++    { ok: false, error: 'COUPON_SOURCE_NOT_HANDLED' },
++  )
++  assert.deepEqual(
++    computeMemberDiscount('bogus' as never, { amountGbp: 13.99, vipActive: false }),
++    { ok: false, error: 'DISCOUNT_SOURCE_INVALID' },
++  )
++})

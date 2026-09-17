@@ -1,0 +1,845 @@
+From ebba3d60bcfa13a5bed34d3e0d971965226b6b4b Mon Sep 17 00:00:00 2001
+From: Zwei-0122 <325088970+Zwei-0122@users.noreply.github.com>
+Date: Wed, 16 Sep 2026 20:42:46 +0100
+Subject: [PATCH 2/8] =?UTF-8?q?docs:=20=E4=BC=9A=E5=91=98=E7=B3=BB?=
+ =?UTF-8?q?=E7=BB=9F=E4=BA=A4=E4=BB=98=E8=AF=B4=E6=98=8E=E3=80=81=E6=A0=B9?=
+ =?UTF-8?q?=20README=E3=80=81=E6=95=B0=E6=8D=AE=E5=BA=93=E9=AA=8C=E6=94=B6?=
+ =?UTF-8?q?=E8=84=9A=E6=9C=AC?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+docs/会员系统交付说明.md 说明实现范围、与 PRD v1 的七处差异与口径解释、
+验证情况与未完成项。docs/verify_member_system.sql 为 26 项数据库验收检查。
+---
+ README.md                                     |  53 ++
+ docs/run_migrations.py                        | 148 ++++++
+ docs/verify_member_system.sql                 | 471 ++++++++++++++++++
+ ...44\344\273\230\350\257\264\346\230\216.md" | 125 +++++
+ 4 files changed, 797 insertions(+)
+ create mode 100644 README.md
+ create mode 100644 docs/run_migrations.py
+ create mode 100644 docs/verify_member_system.sql
+ create mode 100644 "docs/\344\274\232\345\221\230\347\263\273\347\273\237\344\272\244\344\273\230\350\257\264\346\230\216.md"
+
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..e4d42f6
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,53 @@
++# 糖豆人手工工作室 官网 + Tangdouren Club 会员系统
++
++这是 [糖豆人手工工作室官网](https://github.com/KeMiaoDaDi/Tangdouren) 的一份完整副本，包含 **Tangdouren Club 会员系统**的完整实现。克隆下来装好依赖、填好环境变量、在 Supabase 执行两个迁移，就能在本地跑起来。
++
++技术栈：Next.js 16（App Router）、TypeScript、Supabase、Tailwind CSS。
++
++## 会员系统做了什么
++
++- 会员身份：邮箱即身份，不设密码；顾客扫桌上的二维码即可加入或登录，设备会记住身份
++- 到店进度：按伦敦自然日去重，同一天多次到店只算 1 次
++- 奖励引擎：每 10 个计入进度的到店为一轮，第 2 次发 £2 抵用券、第 5 次 £5、第 8 次本人 85 折加朋友 9 折、第 10 次 VIP Month；第二轮门槛落在 12 / 15 / 18 / 20
++- VIP Month：30 天（含首尾），不自动激活、不自动续期，生效期间进度暂停、其他奖励不失效、结算自动 85 折
++- 结算接入：店员在结算面板选择会员奖励，金额由服务端计算并复核，撤销结算可回退未使用的奖励
++
++## 怎么跑起来
++
++先读 **[docs/会员系统交付说明.md](docs/会员系统交付说明.md)**，里面有完整步骤、口径解释、验证情况和未完成项。三步概览：
++
++```bash
++# 1. 环境变量（不进仓库）
++#    建 .env.local，填 NEXT_PUBLIC_SUPABASE_URL / NEXT_PUBLIC_SUPABASE_ANON_KEY /
++#    SUPABASE_SERVICE_ROLE_KEY / NEXT_PUBLIC_APP_URL
++
++# 2. 把 supabase/migrations/016_members.sql 与 017_member_settlement.sql
++#    按顺序在 Supabase 的 SQL Editor 里执行一次（顺序不能反）
++
++# 3. 起服务（用 localhost，不要用 127.0.0.1）
++npm install
++npm run dev -- -p 3002
++```
++
++验证：
++
++```bash
++node --experimental-strip-types --test tests/member.test.ts
++npx tsc --noEmit
++npm run build
++```
++
++数据库层验收脚本在 `docs/verify_member_system.sql`（26 项，全程一个事务，最后 ROLLBACK，不留数据）。
++
++## 当前状态
++
++| 项 | 状态 |
++| --- | --- |
++| 会员系统代码（顾客端 + 后台） | 完成 |
++| 单元测试 32 项 | 通过 |
++| 类型检查、构建 | 通过 |
++| 迁移 | 已写、已静态检查，**尚未在数据库执行** |
++| 后台交互人工点测 | 未做 |
++| PRD 10.3 朋友直接使用 9 折的 UI | 未做（API 已支持） |
++
++细节见 [docs/会员系统交付说明.md](docs/会员系统交付说明.md)。
+diff --git a/docs/run_migrations.py b/docs/run_migrations.py
+new file mode 100644
+index 0000000..ad75918
+--- /dev/null
++++ b/docs/run_migrations.py
+@@ -0,0 +1,148 @@
++#!/usr/bin/env python3
++# ============================================================
++# 在 Supabase 测试项目上执行会员系统的两个迁移，并跑验收检查
++#
++# 用法：
++#   python3 run_migrations.py preflight   # 只看当前库的结构，不改任何东西
++#   python3 run_migrations.py migrate     # 依次执行 016、017
++#   python3 run_migrations.py verify      # 跑验收检查（全程一个事务，最后 ROLLBACK，不留数据）
++#   python3 run_migrations.py all         # preflight + migrate + verify
++#
++# Token 从 ~/.hermes/secrets/supabase_pat 或环境变量 SUPABASE_ACCESS_TOKEN 读取，绝不打印。
++# ============================================================
++
++import json
++import os
++import pathlib
++import sys
++import urllib.error
++import urllib.request
++
++PROJECT_REF = "rlakqwmedlgpcdasvads"
++API = f"https://api.supabase.com/v1/projects/{PROJECT_REF}/database/query"
++REPO = pathlib.Path.home() / "Desktop/Projects/Tangdouren"
++WORKDIR = pathlib.Path(__file__).resolve().parent
++TOKEN_FILE = pathlib.Path.home() / ".hermes/secrets/supabase_pat"
++
++
++def load_token() -> str:
++    token = os.environ.get("SUPABASE_ACCESS_TOKEN", "").strip()
++    if not token and TOKEN_FILE.exists():
++        token = TOKEN_FILE.read_text().strip()
++    if not token:
++        sys.exit(f"没有读到 token。把它存到 {TOKEN_FILE}，或设 SUPABASE_ACCESS_TOKEN 环境变量。")
++    if not token.startswith("sbp_"):
++        print(f"警告：token 不像 Personal Access Token（应以 sbp_ 开头，当前是 {token[:4]}…）")
++    return token
++
++
++def run_sql(token: str, sql: str, label: str):
++    body = json.dumps({"query": sql}).encode("utf-8")
++    req = urllib.request.Request(
++        API,
++        data=body,
++        headers={
++            "Authorization": f"Bearer {token}",
++            "Content-Type": "application/json",
++        },
++        method="POST",
++    )
++    try:
++        with urllib.request.urlopen(req, timeout=120) as resp:
++            raw = resp.read().decode("utf-8")
++    except urllib.error.HTTPError as e:
++        detail = e.read().decode("utf-8", errors="replace")
++        print(f"\n✗ {label} 失败：HTTP {e.code}")
++        print(detail[:2000])
++        return None
++    except Exception as e:  # noqa: BLE001
++        print(f"\n✗ {label} 请求异常：{e}")
++        return None
++    try:
++        return json.loads(raw) if raw.strip() else []
++    except json.JSONDecodeError:
++        return raw
++
++
++def show_rows(rows, title):
++    print(f"\n── {title} ──")
++    if not isinstance(rows, list):
++        print(rows)
++        return
++    for r in rows:
++        if isinstance(r, dict):
++            print("  " + " | ".join(f"{k}={v}" for k, v in r.items()))
++        else:
++            print("  " + str(r))
++
++
++PREFLIGHT = """
++SELECT
++  (SELECT count(*) FROM information_schema.tables
++    WHERE table_schema='public' AND table_name IN ('members','member_rewards','member_benefits')) AS member_tables,
++  (SELECT count(*) FROM information_schema.views
++    WHERE table_schema='public' AND table_name='member_visit_days') AS visit_view,
++  (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
++    WHERE n.nspname='public' AND p.proname IN
++      ('settle_timer_session','unsettle_timer_session','ensure_member_rewards',
++       'member_vip_active','link_timer_session_to_member','activate_member_vip')) AS member_functions,
++  (SELECT count(*) FROM information_schema.columns
++    WHERE table_schema='public' AND table_name='timer_sessions' AND column_name='member_id') AS ts_member_id,
++  (SELECT count(*) FROM information_schema.columns
++    WHERE table_schema='public' AND table_name='timer_sessions' AND column_name='reward_eligible') AS ts_reward_eligible,
++  (SELECT count(*) FROM information_schema.columns
++    WHERE table_schema='public' AND table_name='bookings' AND column_name='member_id') AS bk_member_id,
++  (SELECT count(*) FROM information_schema.columns
++    WHERE table_schema='public' AND table_name='coupons' AND column_name='code') AS coupons_code
++"""
++
++NOT_NULLS = """
++SELECT column_name, data_type, column_default
++  FROM information_schema.columns
++ WHERE table_schema='public' AND table_name='timer_sessions' AND is_nullable='NO'
++ ORDER BY ordinal_position
++"""
++
++
++def main():
++    mode = sys.argv[1] if len(sys.argv) > 1 else "all"
++    token = load_token()
++
++    if mode in ("preflight", "all"):
++        show_rows(run_sql(token, PREFLIGHT, "preflight"), "迁移前结构（members 相关应为 0）")
++        show_rows(run_sql(token, NOT_NULLS, "timer_sessions 的 NOT NULL 列"), "必填列")
++
++    if mode in ("migrate", "all"):
++        for name in ("016_members.sql", "017_member_settlement.sql"):
++            path = REPO / "supabase/migrations" / name
++            sql = path.read_text(encoding="utf-8")
++            print(f"\n▶ 执行 {name}（{len(sql.encode('utf-8'))} 字节）…")
++            result = run_sql(token, sql, name)
++            if result is None:
++                return
++            print(f"✓ {name} 执行完成：{result if result else '（无返回）'}")
++        show_rows(run_sql(token, PREFLIGHT, "迁移后结构"), "迁移后结构（预期全是 1 / members 表 3）")
++
++    if mode in ("verify", "all"):
++        path = WORKDIR / "verify_member_system.sql"
++        print(f"\n▶ 跑验收检查 {path.name}（最后会 ROLLBACK，不留测试数据）…")
++        rows = run_sql(token, path.read_text(encoding="utf-8"), "验收检查")
++        if rows is None:
++            return
++        if isinstance(rows, list) and rows and isinstance(rows[0], dict) and "结果" in rows[0]:
++            ok = sum(1 for r in rows if r.get("结果") == "PASS")
++            bad = [r for r in rows if r.get("结果") != "PASS"]
++            for r in rows:
++                mark = "✔" if r.get("结果") == "PASS" else "✗"
++                print(f"  {mark} [{r.get('编号')}] {r.get('检查项')}  期望={r.get('期望')}  实际={r.get('实际')}")
++            print(f"\n{ok}/{len(rows)} 项通过")
++            if bad:
++                print("未通过的项目：")
++                for r in bad:
++                    print(f"  - {r.get('检查项')}: 期望 {r.get('期望')}，实际 {r.get('实际')}")
++        else:
++            show_rows(rows, "验收检查原始返回")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/docs/verify_member_system.sql b/docs/verify_member_system.sql
+new file mode 100644
+index 0000000..48c342b
+--- /dev/null
++++ b/docs/verify_member_system.sql
+@@ -0,0 +1,471 @@
++-- ============================================================
++-- 会员系统验收检查（PRD 24 里能在数据库层验证的部分）
++--
++-- 全部在一个事务里跑，最后 ROLLBACK：测试库里不会留下任何测试数据。
++-- 结果写进临时表 chk，脚本最后 SELECT 出来。
++-- ============================================================
++
++BEGIN;
++
++CREATE TEMP TABLE chk (
++  编号   serial,
++  检查项 text,
++  期望   text,
++  实际   text,
++  结果   text
++) ON COMMIT DROP;
++
++DO $verify$
++DECLARE
++  v_today    date := (NOW() AT TIME ZONE 'Europe/London')::date;
++  v_a        uuid;   -- 进度 12 的会员
++  v_b        uuid;   -- 进度 1 的会员，用来测「刚解锁的奖励」与撤销守卫
++  v_s        text;
++  v_s2       text;
++  v_vip_c1   uuid;
++  v_vip_c2   uuid;
++  v_benefit  uuid;
++  v_coupon   uuid;
++  v_cnt      integer;
++  v_num      numeric;
++  v_txt      text;
++  v_bool     boolean;
++BEGIN
++  ------------------------------------------------------------------
++  -- 0. 结构
++  ------------------------------------------------------------------
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('members 表存在', 'true',
++     (EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='members'))::text,
++     CASE WHEN EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='members') THEN 'PASS' ELSE 'FAIL' END),
++    ('member_rewards 表存在', 'true',
++     (EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='member_rewards'))::text,
++     CASE WHEN EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='member_rewards') THEN 'PASS' ELSE 'FAIL' END),
++    ('member_benefits 表存在', 'true',
++     (EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='member_benefits'))::text,
++     CASE WHEN EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name='member_benefits') THEN 'PASS' ELSE 'FAIL' END),
++    ('member_visit_days 视图存在', 'true',
++     (EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='public' AND table_name='member_visit_days'))::text,
++     CASE WHEN EXISTS (SELECT 1 FROM information_schema.views WHERE table_schema='public' AND table_name='member_visit_days') THEN 'PASS' ELSE 'FAIL' END),
++    ('settle 函数已是 8 参数版', '8',
++     (SELECT count(*)::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
++       WHERE n.nspname='public' AND p.proname='settle_timer_session' AND p.pronargs=8),
++     CASE WHEN (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
++       WHERE n.nspname='public' AND p.proname='settle_timer_session' AND p.pronargs=8) = 1 THEN 'PASS' ELSE 'FAIL' END);
++
++  -- timer_sessions 的列
++  INSERT INTO chk (检查项, 期望, 实际, 结果)
++  SELECT 'timer_sessions.member_id 列存在', 'true', count(*)::text,
++         CASE WHEN count(*) = 1 THEN 'PASS' ELSE 'FAIL' END
++    FROM information_schema.columns
++   WHERE table_schema='public' AND table_name='timer_sessions' AND column_name='member_id';
++
++  INSERT INTO chk (检查项, 期望, 实际, 结果)
++  SELECT 'timer_sessions.reward_eligible 列存在', 'true', count(*)::text,
++         CASE WHEN count(*) = 1 THEN 'PASS' ELSE 'FAIL' END
++    FROM information_schema.columns
++   WHERE table_schema='public' AND table_name='timer_sessions' AND column_name='reward_eligible';
++
++  INSERT INTO chk (检查项, 期望, 实际, 结果)
++  SELECT 'bookings 没有 member_id 列（本次收窄）', '0', count(*)::text,
++         CASE WHEN count(*) = 0 THEN 'PASS' ELSE 'FAIL' END
++    FROM information_schema.columns
++   WHERE table_schema='public' AND table_name='bookings' AND column_name='member_id';
++
++  ------------------------------------------------------------------
++  -- 1. 造会员 A：12 个不同伦敦日期的已结算、计入进度的到店
++  ------------------------------------------------------------------
++  INSERT INTO members (email, email_key, display_name, consent_source)
++  VALUES ('hermes.a@example.com', 'hermes.a@example.com', '甲', 'in_store')
++  RETURNING member_id INTO v_a;
++
++  INSERT INTO members (email, email_key, display_name, consent_source)
++  VALUES ('hermes.b@example.com', 'hermes.b@example.com', '乙', 'booking')
++  RETURNING member_id INTO v_b;
++
++  FOR v_cnt IN 1..12 LOOP
++    INSERT INTO timer_sessions (
++      session_id, customer_name, status, started_at, is_settled, settled_at, settled_by,
++      billing_minutes, amount_gbp, actual_amount_gbp, created_via, created_by,
++      member_id, reward_eligible
++    ) VALUES (
++      'HT-A-' || lpad(v_cnt::text, 3, '0'), '甲', 'completed',
++      ((v_today - 200 + v_cnt)::timestamp + interval '12 hours') AT TIME ZONE 'Europe/London',
++      true, NOW(), 'hermes_test', 60, 13.99, 13.99, 'self_service', 'hermes_test',
++      v_a, true
++    );
++  END LOOP;
++
++  SELECT count(*) INTO v_cnt FROM member_visit_days WHERE member_id = v_a;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('12 个不同日期 = 12 次到店', '12', v_cnt::text, CASE WHEN v_cnt = 12 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT count(*) INTO v_cnt FROM member_visit_days WHERE member_id = v_a AND reward_eligible;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('Reward Progress 也是 12', '12', v_cnt::text, CASE WHEN v_cnt = 12 THEN 'PASS' ELSE 'FAIL' END);
++
++  -- 同一会员同一天再来一条已结算单：只算 1 次
++  INSERT INTO timer_sessions (
++    session_id, customer_name, status, started_at, is_settled, settled_at, settled_by,
++    billing_minutes, amount_gbp, actual_amount_gbp, created_via, created_by, member_id, reward_eligible
++  ) VALUES (
++    'HT-A-DUP', '甲', 'completed',
++    ((v_today - 199)::timestamp + interval '18 hours') AT TIME ZONE 'Europe/London',
++    true, NOW(), 'hermes_test', 60, 13.99, 13.99, 'self_service', 'hermes_test', v_a, true
++  );
++
++  SELECT count(*) INTO v_cnt FROM member_visit_days WHERE member_id = v_a;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('同一天多条已结算单只算 1 次', '12', v_cnt::text, CASE WHEN v_cnt = 12 THEN 'PASS' ELSE 'FAIL' END);
++
++  ------------------------------------------------------------------
++  -- 2. 解锁：12 次进度 → 第一轮 5 张 + 第二轮 £2
++  ------------------------------------------------------------------
++  PERFORM ensure_member_rewards(v_a, NULL);
++
++  SELECT count(*) INTO v_cnt FROM member_rewards WHERE member_id = v_a;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('12 次进度解锁 6 张（第一轮 5 + 第二轮 £2）', '6', v_cnt::text,
++     CASE WHEN v_cnt = 6 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT count(*) INTO v_cnt
++    FROM (VALUES (1,'TWO_POUND'),(1,'FIVE_POUND'),(1,'PERSONAL_15_OFF'),(1,'FRIEND_10_OFF'),(1,'VIP_MONTH'),(2,'TWO_POUND')) AS e(cycle_index, reward_type)
++    JOIN member_rewards r ON r.member_id = v_a AND r.cycle_index = e.cycle_index AND r.reward_type = e.reward_type;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('档位与轮次都对（含第二轮 £2）', '6', v_cnt::text, CASE WHEN v_cnt = 6 THEN 'PASS' ELSE 'FAIL' END);
++
++  PERFORM ensure_member_rewards(v_a, NULL);
++  SELECT count(*) INTO v_cnt FROM member_rewards WHERE member_id = v_a;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('重复调用不会多发（幂等）', '6', v_cnt::text, CASE WHEN v_cnt = 6 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT count(*) INTO v_cnt FROM member_benefits WHERE member_id = v_a;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('VIP Month 解锁即建一条未激活权益', '1', v_cnt::text, CASE WHEN v_cnt = 1 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT count(*) INTO v_cnt FROM member_benefits WHERE member_id = v_a AND activated_on IS NOT NULL;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('VIP Month 不自动激活', '0', v_cnt::text, CASE WHEN v_cnt = 0 THEN 'PASS' ELSE 'FAIL' END);
++
++  -- 券类奖励解锁时是否自动生成了内部券
++  SELECT count(*) INTO v_cnt
++    FROM member_rewards r JOIN coupons c ON c.coupon_id = r.coupon_id
++   WHERE r.member_id = v_a AND r.reward_type IN ('TWO_POUND','FIVE_POUND');
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('£2/£5 解锁时自动生成内部券', '3', v_cnt::text, CASE WHEN v_cnt = 3 THEN 'PASS' ELSE 'FAIL' END);
++
++  ------------------------------------------------------------------
++  -- 3. VIP 激活与日期边界
++  ------------------------------------------------------------------
++  SELECT reward_id INTO v_vip_c1 FROM member_rewards
++   WHERE member_id = v_a AND reward_type = 'VIP_MONTH' AND cycle_index = 1;
++  SELECT benefit_id INTO v_benefit FROM member_benefits WHERE reward_id = v_vip_c1;
++
++  PERFORM activate_member_vip(v_vip_c1, 'hermes_test');
++
++  SELECT expires_on INTO v_txt FROM member_benefits WHERE benefit_id = v_benefit;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('激活后到期日 = 今天 + 29 天', (v_today + 29)::text, v_txt,
++     CASE WHEN v_txt = (v_today + 29)::text THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT member_vip_active(v_a, NOW()) INTO v_bool;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('激活当天已生效', 'true', v_bool::text, CASE WHEN v_bool THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT member_vip_active(v_a, ((v_today + 29)::timestamp + interval '12 hours') AT TIME ZONE 'Europe/London') INTO v_bool;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('到期日当天仍有效', 'true', v_bool::text, CASE WHEN v_bool THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT member_vip_active(v_a, ((v_today + 30)::timestamp + interval '12 hours') AT TIME ZONE 'Europe/London') INTO v_bool;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('到期次日失效', 'false', v_bool::text, CASE WHEN NOT v_bool THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT member_vip_active(v_a, ((v_today - 1)::timestamp + interval '12 hours') AT TIME ZONE 'Europe/London') INTO v_bool;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('激活前一天不算生效', 'false', v_bool::text, CASE WHEN NOT v_bool THEN 'PASS' ELSE 'FAIL' END);
++
++  -- 已有生效中的一张时，不允许再激活第二张
++  INSERT INTO member_rewards (member_id, reward_type, cycle_index)
++  VALUES (v_a, 'VIP_MONTH', 2) RETURNING reward_id INTO v_vip_c2;
++  INSERT INTO member_benefits (member_id, reward_id) VALUES (v_a, v_vip_c2);
++  BEGIN
++    PERFORM activate_member_vip(v_vip_c2, 'hermes_test');
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('已有生效中的 VIP 时拒绝激活第二张', 'VIP_ALREADY_ACTIVE', '居然成功了', 'FAIL');
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('已有生效中的 VIP 时拒绝激活第二张', 'VIP_ALREADY_ACTIVE', SQLERRM,
++       CASE WHEN SQLERRM LIKE '%VIP_ALREADY_ACTIVE%' THEN 'PASS' ELSE 'FAIL' END);
++  END;
++
++  ------------------------------------------------------------------
++  -- 4. VIP 期间结算：自动 85 折、进度暂停、不能改用别的优惠
++  ------------------------------------------------------------------
++  INSERT INTO timer_sessions (
++    session_id, customer_name, status, started_at, is_settled,
++    billing_minutes, amount_gbp, created_via, created_by, member_id
++  ) VALUES ('HT-VIP-1', '甲', 'completed', NOW() - interval '1 hour', false,
++            60, 13.99, 'self_service', 'hermes_test', v_a)
++  RETURNING session_id INTO v_s;
++
++  PERFORM settle_timer_session(v_s, 'hermes_test', NULL, NULL, 210, 'vip_month', v_a, NULL);
++
++  SELECT actual_amount_gbp INTO v_num FROM timer_sessions WHERE session_id = v_s;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('VIP 期间结算自动 85 折（13.99 → 11.89）', '11.89', v_num::text,
++     CASE WHEN v_num = 11.89 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT reward_eligible INTO v_bool FROM timer_sessions WHERE session_id = v_s;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('VIP 期间的单不计入 Reward Progress', 'false', v_bool::text,
++     CASE WHEN v_bool IS FALSE THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT count(*) INTO v_cnt FROM member_visit_days WHERE member_id = v_a;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('VIP 期间 Lifetime 照常加（12 → 13）', '13', v_cnt::text,
++     CASE WHEN v_cnt = 13 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT count(*) INTO v_cnt FROM member_visit_days WHERE member_id = v_a AND reward_eligible;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('VIP 期间 Reward Progress 停住（仍为 12）', '12', v_cnt::text,
++     CASE WHEN v_cnt = 12 THEN 'PASS' ELSE 'FAIL' END);
++
++  INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled,
++    billing_minutes, amount_gbp, created_via, created_by, member_id)
++  VALUES ('HT-VIP-2', '甲', 'completed', NOW() - interval '30 minutes', false,
++          60, 13.99, 'self_service', 'hermes_test', v_a)
++  RETURNING session_id INTO v_s2;
++
++  BEGIN
++    PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, NULL, 200, 'member_reward', v_a, 'TWO_POUND');
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('VIP 期间不能改用会员奖励', 'VIP_MUST_BE_APPLIED', '居然结算成功', 'FAIL');
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('VIP 期间不能改用会员奖励', 'VIP_MUST_BE_APPLIED', SQLERRM,
++       CASE WHEN SQLERRM LIKE '%VIP_MUST_BE_APPLIED%' THEN 'PASS' ELSE 'FAIL' END);
++  END;
++
++  INSERT INTO coupons (code, discount_type, discount_value, created_by)
++  VALUES ('HTTEST0001', 'percentage_off', 10, 'hermes_test') RETURNING coupon_id INTO v_coupon;
++
++  BEGIN
++    PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, 'HTTEST0001', 140, 'coupon', NULL, NULL);
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('VIP 期间普通优惠券也走强制 VIP（我们补的解释）', 'VIP_MUST_BE_APPLIED', '居然结算成功', 'FAIL');
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('VIP 期间普通优惠券也走强制 VIP（我们补的解释）', 'VIP_MUST_BE_APPLIED', SQLERRM,
++       CASE WHEN SQLERRM LIKE '%VIP_MUST_BE_APPLIED%' THEN 'PASS' ELSE 'FAIL' END);
++  END;
++
++  -- 让这张 VIP 过期，回到非 VIP 状态继续测别的
++  UPDATE member_benefits
++     SET activated_on = v_today - 40,
++         activated_at = NOW(),
++         expires_on   = v_today - 40 + 29,
++         activated_by = 'hermes_test'
++   WHERE benefit_id = v_benefit;
++
++  SELECT member_vip_active(v_a, NOW()) INTO v_bool;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('把激活日改到 40 天前后 VIP 不再生效', 'false', v_bool::text,
++     CASE WHEN NOT v_bool THEN 'PASS' ELSE 'FAIL' END);
++
++  ------------------------------------------------------------------
++  -- 5. £2 抵用券：结算、核销、撤销回退
++  ------------------------------------------------------------------
++  INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled,
++    billing_minutes, amount_gbp, created_via, created_by, member_id)
++  VALUES ('HT-A-VCH', '甲', 'completed', NOW() - interval '20 minutes', false,
++          60, 13.99, 'self_service', 'hermes_test', v_a)
++  RETURNING session_id INTO v_s;
++
++  PERFORM settle_timer_session(v_s, 'hermes_test', NULL, NULL, 200, 'member_reward', v_a, 'TWO_POUND');
++
++  SELECT actual_amount_gbp INTO v_num FROM timer_sessions WHERE session_id = v_s;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('£2 抵用券结算（13.99 → 11.99）', '11.99', v_num::text,
++     CASE WHEN v_num = 11.99 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT count(*) INTO v_cnt FROM member_rewards
++   WHERE member_id = v_a AND reward_type = 'TWO_POUND' AND used_at IS NOT NULL;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('只核销了 1 张 £2（同类多张取最早）', '1', v_cnt::text,
++     CASE WHEN v_cnt = 1 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT count(*) INTO v_cnt
++    FROM member_rewards r JOIN coupons c ON c.coupon_id = r.coupon_id
++   WHERE r.member_id = v_a AND r.used_session_id = v_s AND c.redeemed_session_id = v_s;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('对应的内部券同步核销', '1', v_cnt::text, CASE WHEN v_cnt = 1 THEN 'PASS' ELSE 'FAIL' END);
++
++  PERFORM unsettle_timer_session(v_s);
++
++  SELECT count(*) INTO v_cnt FROM member_rewards
++   WHERE member_id = v_a AND used_session_id IS NULL AND used_at IS NULL
++     AND reward_type = 'TWO_POUND' AND cycle_index = 1;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('撤销结算后 £2 退回未使用', '1', v_cnt::text, CASE WHEN v_cnt = 1 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT count(*) INTO v_cnt
++    FROM member_rewards r JOIN coupons c ON c.coupon_id = r.coupon_id
++   WHERE r.member_id = v_a AND r.reward_type = 'TWO_POUND' AND r.cycle_index = 1
++     AND c.redeemed_at IS NULL;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('撤销结算后内部券回到未核销', '1', v_cnt::text, CASE WHEN v_cnt = 1 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT reward_eligible INTO v_txt FROM timer_sessions WHERE session_id = v_s;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('撤销结算后进度资格被清空', NULL::text, v_txt,
++     CASE WHEN v_txt IS NULL THEN 'PASS' ELSE 'FAIL' END);
++
++  ------------------------------------------------------------------
++  -- 6. 朋友 9 折用在他人的订单上 / 本人券不能给他人
++  ------------------------------------------------------------------
++  INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled,
++    billing_minutes, amount_gbp, created_via, created_by, member_id)
++  VALUES ('HT-GUEST-1', '散客', 'completed', NOW() - interval '15 minutes', false,
++          60, 13.99, 'self_service', 'hermes_test', NULL)
++  RETURNING session_id INTO v_s2;
++
++  PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, NULL, 140, 'member_reward', v_a, 'FRIEND_10_OFF');
++
++  SELECT actual_amount_gbp INTO v_num FROM timer_sessions WHERE session_id = v_s2;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('朋友 9 折可用在他人订单上（13.99 → 12.59）', '12.59', v_num::text,
++     CASE WHEN v_num = 12.59 THEN 'PASS' ELSE 'FAIL' END);
++
++  SELECT reward_eligible INTO v_txt FROM timer_sessions WHERE session_id = v_s2;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('散客单不产生任何人的进度（reward_eligible 为 NULL）', NULL::text, v_txt,
++     CASE WHEN v_txt IS NULL THEN 'PASS' ELSE 'FAIL' END);
++
++  INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled,
++    billing_minutes, amount_gbp, created_via, created_by, member_id)
++  VALUES ('HT-GUEST-2', '散客二', 'completed', NOW() - interval '10 minutes', false,
++          60, 13.99, 'self_service', 'hermes_test', NULL)
++  RETURNING session_id INTO v_s;
++
++  BEGIN
++    PERFORM settle_timer_session(v_s, 'hermes_test', NULL, NULL, 210, 'member_reward', v_a, 'PERSONAL_15_OFF');
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('本人 85 折不能用在他人订单上', 'MEMBER_SESSION_MISMATCH', '居然结算成功', 'FAIL');
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('本人 85 折不能用在他人订单上', 'MEMBER_SESSION_MISMATCH', SQLERRM,
++       CASE WHEN SQLERRM LIKE '%MEMBER_SESSION_MISMATCH%' THEN 'PASS' ELSE 'FAIL' END);
++  END;
++
++  ------------------------------------------------------------------
++  -- 7. 刚解锁的奖励不能用于产生它的那笔消费（PRD 8）
++  ------------------------------------------------------------------
++  INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled, settled_at, settled_by,
++    billing_minutes, amount_gbp, actual_amount_gbp, created_via, created_by, member_id, reward_eligible)
++  VALUES ('HT-B-001', '乙', 'completed',
++          ((v_today - 30)::timestamp + interval '12 hours') AT TIME ZONE 'Europe/London',
++          true, NOW(), 'hermes_test', 60, 13.99, 13.99, 'self_service', 'hermes_test', v_b, true);
++
++  INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled,
++    billing_minutes, amount_gbp, created_via, created_by, member_id)
++  VALUES ('HT-B-002', '乙', 'completed', NOW() - interval '5 minutes', false,
++          60, 13.99, 'self_service', 'hermes_test', v_b)
++  RETURNING session_id INTO v_s;
++
++  BEGIN
++    PERFORM settle_timer_session(v_s, 'hermes_test', NULL, NULL, 200, 'member_reward', v_b, 'TWO_POUND');
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('刚解锁的奖励不能用于产生它的那笔消费', 'MEMBER_REWARD_UNAVAILABLE', '居然结算成功', 'FAIL');
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('刚解锁的奖励不能用于产生它的那笔消费', 'MEMBER_REWARD_UNAVAILABLE', SQLERRM,
++       CASE WHEN SQLERRM LIKE '%MEMBER_REWARD_UNAVAILABLE%' THEN 'PASS' ELSE 'FAIL' END);
++  END;
++
++  -- 这笔结算本身把 £2 解锁出来，并且没有被自己用掉
++  PERFORM settle_timer_session(v_s, 'hermes_test', NULL, NULL, 0, 'none', NULL, NULL);
++
++  SELECT count(*) INTO v_cnt FROM member_rewards
++   WHERE member_id = v_b AND reward_type = 'TWO_POUND' AND cycle_index = 1
++     AND unlocked_by_session_id = v_s AND used_at IS NULL;
++  INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++    ('第 2 次到店解锁 £2 且未被本单使用', '1', v_cnt::text, CASE WHEN v_cnt = 1 THEN 'PASS' ELSE 'FAIL' END);
++
++  ------------------------------------------------------------------
++  -- 8. 撤销守卫：奖励已被后续使用则不许撤销来源结算
++  ------------------------------------------------------------------
++  INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled,
++    billing_minutes, amount_gbp, created_via, created_by, member_id)
++  VALUES ('HT-B-003', '乙', 'completed', NOW() - interval '3 minutes', false,
++          60, 13.99, 'self_service', 'hermes_test', v_b)
++  RETURNING session_id INTO v_s2;
++
++  PERFORM settle_timer_session(v_s2, 'hermes_test', NULL, NULL, 200, 'member_reward', v_b, 'TWO_POUND');
++
++  BEGIN
++    PERFORM unsettle_timer_session(v_s);
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('奖励已被后续使用则不许撤销来源结算', 'REWARD_ALREADY_USED', '居然撤销成功', 'FAIL');
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('奖励已被后续使用则不许撤销来源结算', 'REWARD_ALREADY_USED', SQLERRM,
++       CASE WHEN SQLERRM LIKE '%REWARD_ALREADY_USED%' THEN 'PASS' ELSE 'FAIL' END);
++  END;
++
++  ------------------------------------------------------------------
++  -- 9. 约束守卫生效
++  ------------------------------------------------------------------
++  BEGIN
++    INSERT INTO member_rewards (member_id, reward_type, cycle_index, coupon_id)
++    VALUES (v_b, 'PERSONAL_15_OFF', 90, v_coupon);
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('不可转赠的奖励不能挂券', '被约束拦住', '居然插进去了', 'FAIL');
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('不可转赠的奖励不能挂券', '被约束拦住', SQLERRM,
++       CASE WHEN SQLERRM LIKE '%member_rewards_coupon_check%' THEN 'PASS' ELSE 'FAIL' END);
++  END;
++
++  BEGIN
++    INSERT INTO timer_sessions (session_id, customer_name, status, started_at, is_settled,
++      billing_minutes, amount_gbp, created_via, created_by, member_id, reward_eligible)
++    VALUES ('HT-BAD-1', '散客', 'completed', NOW(), true, 60, 13.99, 'self_service', 'hermes_test', NULL, true);
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('散客单不能标为计入进度', '被约束拦住', '居然插进去了', 'FAIL');
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('散客单不能标为计入进度', '被约束拦住', SQLERRM,
++       CASE WHEN SQLERRM LIKE '%timer_sessions_reward_eligible_check%' THEN 'PASS' ELSE 'FAIL' END);
++  END;
++
++  BEGIN
++    INSERT INTO member_rewards (member_id, reward_type, cycle_index, unlocked_at, coupon_id, used_at, used_by, used_session_id)
++    VALUES (v_b, 'FRIEND_10_OFF', 91, NOW(), v_coupon, NOW(), 'hermes_test', 'HT-B-003');
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('已转赠的朋友券不能再直接核销', '被约束拦住', '居然插进去了', 'FAIL');
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('已转赠的朋友券不能再直接核销', '被约束拦住', SQLERRM,
++       CASE WHEN SQLERRM LIKE '%member_rewards_friend_transfer_check%' THEN 'PASS' ELSE 'FAIL' END);
++  END;
++
++  ------------------------------------------------------------------
++  -- 10. 撤下 VIP 之后能正常激活下一张（不自动续，要手动）
++  ------------------------------------------------------------------
++  BEGIN
++    PERFORM activate_member_vip(v_vip_c2, 'hermes_test');
++    SELECT count(*) INTO v_cnt FROM member_benefits
++     WHERE member_id = v_a AND activated_on IS NOT NULL
++       AND v_today BETWEEN activated_on AND expires_on;
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('上一张过期后可以手动激活下一张', '1', v_cnt::text,
++       CASE WHEN v_cnt = 1 THEN 'PASS' ELSE 'FAIL' END);
++  EXCEPTION WHEN OTHERS THEN
++    INSERT INTO chk (检查项, 期望, 实际, 结果) VALUES
++      ('上一张过期后可以手动激活下一张', '1', '报错：' || SQLERRM, 'FAIL');
++  END;
++END $verify$;
++
++SELECT 编号, 检查项, 期望, 实际, 结果 FROM chk ORDER BY 编号;
++
++ROLLBACK;
+diff --git "a/docs/\344\274\232\345\221\230\347\263\273\347\273\237\344\272\244\344\273\230\350\257\264\346\230\216.md" "b/docs/\344\274\232\345\221\230\347\263\273\347\273\237\344\272\244\344\273\230\350\257\264\346\230\216.md"
+new file mode 100644
+index 0000000..e6664f7
+--- /dev/null
++++ "b/docs/\344\274\232\345\221\230\347\263\273\347\273\237\344\272\244\344\273\230\350\257\264\346\230\216.md"
+@@ -0,0 +1,125 @@
++# Tangdouren Club 会员系统 交付说明
++
++这份文档说明会员系统在哪些文件里实现、跟 PRD v1 有哪些差异、验证到什么程度、还有什么没做。
++
++---
++
++## 一、怎么跑起来
++
++**1. 环境变量**（不进仓库，自己建 `.env.local`）
++
++```
++NEXT_PUBLIC_SUPABASE_URL=
++NEXT_PUBLIC_SUPABASE_ANON_KEY=
++SUPABASE_SERVICE_ROLE_KEY=
++NEXT_PUBLIC_APP_URL=
++```
++
++**2. 执行迁移**（必须，否则会员功能不可用）
++
++把 `supabase/migrations/016_members.sql`、`017_member_settlement.sql` 按顺序发到数据库执行一次。
++顺序不能反，`017` 依赖 `016` 建的表和列。执行方式二选一：
++
++- Supabase 控制台的 SQL Editor：粘贴全文，点 Run，看到 `Success. No rows returned` 即可。
++- 或走 Management API：`docs/run_migrations.py`（需要 Personal Access Token，存到 `~/.hermes/secrets/supabase_pat`）。
++
++两个文件都写得可以重复执行（`IF NOT EXISTS`、先 `DROP CONSTRAINT` 再加），手抖点两次不会坏。
++
++**3. 本地起服务**
++
++```bash
++npm install
++npm run dev -- -p 3002
++```
++
++注意用 `http://localhost:3002` 访问，不要用 `127.0.0.1`。Next.js 16 把不同 host 视作跨源，会拦掉 dev 资源，页面看似正常但完全不 hydrate，所有点击都没反应。
++
++**4. 验证**
++
++```bash
++node --experimental-strip-types --test tests/member.test.ts   # 32 项
++npx tsc --noEmit
++npm run build
++```
++
++数据库层验收：`docs/verify_member_system.sql`，26 项检查，覆盖 VIP 日期边界、刚解锁的奖励能不能当次用、撤销结算后奖励回退、朋友券用在他人的订单上等。整个脚本在一个事务里跑，末尾 `ROLLBACK`，不会留测试数据。
++
++---
++
++## 二、迁移做了什么
++
++| 迁移 | 内容 |
++| --- | --- |
++| `016_members.sql` | 建 `members` 表（邮箱唯一身份、3 条约束、3 个索引、开 RLS）；给 `timer_sessions` 加 `member_id` 与 `reward_eligible` 两列（含 CHECK）；给 `bookings` 加 `idx_bookings_email_key` |
++| `017_member_settlement.sql` | 建 `member_rewards`（5 条 CHECK、4 个索引）、`member_benefits`（2 条 CHECK、1 个索引）；建 `member_visit_days` 视图；建 6 个函数：`member_vip_active`、`ensure_member_rewards`、`settle_timer_session`（5 参数版换成 8 参数版）、`unsettle_timer_session`、`link_timer_session_to_member`、`activate_member_vip` |
++
++`timer_sessions.reward_eligible` 是一次结算那一刻固化下来的判断（该单是否有会员归属、且结算时没有生效中的 VIP Month），不是事后推算的。因为 VIP 从激活时刻起暂停进度，事后重算会把激活当天算错。
++
++**迁移未执行前，应用照常工作**。这是刻意设计的：新代码在解析不出会员时不写 `member_id` 列；结算只在真的用会员折扣时才向 RPC 传新参数。所以计时、预约、优惠券、原有结算全都不受影响，只是会员功能不生效。
++
++---
++
++## 三、实现范围
++
++| 层 | 文件 | 内容 |
++| --- | --- | --- |
++| 纯函数 | `lib/member/member.ts` | 身份校验、伦敦日期、到店按日去重、Lifetime 与 Reward Progress 两个计数、轮次与档位门槛、下一个奖励提示、进度条节点、奖励可用性判定、同类取最早、VIP 生效判定与排队、折扣计算 |
++| 数据层 | `lib/member/service.ts` | 会员识别与加入、会员页数据组装、后台动作、结算台所需信息、错误码中文文案 |
++| API | `app/api/member/{join,lookup,dashboard,activate-vip}` | 会员端四个路由 |
++| API | `app/api/admin/members`、`app/api/admin/members/[id]` | 后台列表、详情，以及六个动作：停用/恢复、改名、挂订单、激活 VIP、关联朋友券 |
++| 接入 | `app/api/bookings` | 预约提交时按勾选建会员 |
++| 接入 | `lib/timer/selfService.ts`、`app/api/self-timer/start` | 以会员身份开始计时时写入归属 |
++| 接入 | `app/api/admin/timers/[id]` | 结算接会员折扣，GET 一并返回会员信息供核对 |
++| 接入 | `app/api/admin/timers` | 列表带会员标记（单独查询，不做 join） |
++| UI 顾客端 | `app/(site)/self-timer`、`self-timer/club`、`booking`、`components/member/MemberProgressBar.tsx` | 第三个入口、加入/登录、设备记忆、会员首页（进度条、奖励、到店记录、奖励记录、激活 VIP）、预约页勾选框 |
++| UI 后台 | `app/(admin)/dashboard/members`、`dashboard/timers`、`dashboard/timers/[id]`、`components/admin/Sidebar.tsx` | 会员列表与详情、计时列表会员标记、结算面板会员优惠选择器 |
++| 测试 | `tests/member.test.ts` | 32 项，断言逐条对 PRD 的例子，例如 `vipExpiresOn('2026-09-18') === '2026-10-17'` |
++
++---
++
++## 四、与 PRD v1 的差异与口径解释
++
++| # | PRD 说法 | 实际做法与理由 |
++| --- | --- | --- |
++| 1 | 19.2 结算时固化进度资格 | 认同并采纳，新增 `reward_eligible` 列，结算那一刻写死 |
++| 2 | 8 解锁奖励不能用于当次消费 | 折扣按结算前快照计算，奖励解锁放在结算成功之后；挑奖励时排除本单解锁的那张 |
++| 3 | 10.4 Friend Reward 转赠 | 复用现有 Coupon Generator 出一张普通 10% 券，`member_rewards.coupon_id` 指过去，关联后这张奖励不能再直接使用。没有新开发 Gift Code |
++| 4 | 未提 `bookings.member_id` | **不采纳**。预约页注册不改变计时归属，后台按 `email_key` 反查即可，加列是多余的猜测 |
++| 5 | 11.6 多张 VIP Month | 可累计多张未激活，同一时间最多一张生效，到期不自动续，需要手动激活下一张 |
++| 6 | 18 撤销结算 | 未使用的可撤销回退；奖励已被后续消费用掉则拒绝撤销并提示，交管理员判断 |
++| 7 | 后台禁操作 | 后台不能手动加减到店次数、不能直接改进度、不能补发奖励、不能改邮箱、不能删历史。金额只在结算面板由服务端计算 |
++
++**两处替 PRD 补的解释，需要店主确认**：
++
++1. **Link to Member 只允许挂尚未结算的订单**。PRD 5.2 没说时点。选严格版本的理由是进度必须来自真实结算记录，允许事后改归属等于绕过台账改数字，正是 PRD 第 25 节要防的事。代价是店员遇到已结算的订单要多点两下：先撤销结算、挂上、再结算。
++2. **VIP Month 生效期间，普通优惠券也一并禁用**，一律走 85 折。PRD 11.4 的清单只点名了会员奖励。要放开只改 `settle_timer_session` 里 `vip_active AND v_source <> 'vip_month'` 这一处判断。
++
++---
++
++## 五、验证情况
++
++**已验证**
++
++| 项 | 证据 |
++| --- | --- |
++| 32 项单元测试 | `tests 76 / pass 76 / fail 0`（会员 32 项 + 原有 44 项未破坏） |
++| 类型检查 | `npx tsc --noEmit` 无输出 |
++| 构建 | `✓ Compiled successfully`，35 个静态页 |
++| 顾客端界面可渲染 | 浏览器实际走通：入口 → 加入会员表单 → 填表勾选 → 提交 → 界面上显示服务端返回的错误文案 |
++| 权限守卫 | 后台页面未登录 `307 → /login`；后台 API 未登录 `401` |
++| 迁移未执行时不影响现有功能 | 计时、预约、结算、优惠券路径冒烟测试全部照旧 |
++
++**未验证**
++
++1. **两个迁移从未在任何数据库执行过**。本机无 `psql`、无 libpq、无 docker、无 Supabase CLI、`node_modules` 里也没有 pg 驱动，所以一直以「已写、已静态检查、未执行」状态交付。
++2. **后台交互没有人工点测**。结算面板、会员列表与详情需要登录态，未做端到端点击验证。
++3. **会员首页在真实数据下的渲染没看过**。进度条、奖励列表、VIP 卡片这些依赖真实会员数据。
++4. **`npm run lint` 跑不起来**，仓库根目录没有任何 eslint 配置。这是既有状态，未改动。
++
++---
++
++## 六、未完成项
++
++1. **PRD 10.3 朋友直接使用 9 折**：朋友到店时店员直接把这位朋友的优惠用在朋友的订单上。API 已支持（结算接口收 `p_member_id`，允许 `FRIEND_10_OFF` 用在他人订单上），但结算面板只列本单会员自己的奖励，**没有做会员搜索 UI**。目前朋友场景走 10.4 的转赠路径。
++2. **跨设备的会员识别**（扫码直接登录而不依赖同设备 localStorage）未做。当前是 PRD 4.3 允许的「记住这台设备」。
++3. **PRD 本身未修订**。本次发现的差异先记在这份文档里，等 PRD 出 v1.1 一起改。
